@@ -154,6 +154,14 @@ option(Hydrogen_ENABLE_CUDA
   "Search for CUDA support and enable related features if found."
   OFF)
 
+option(Hydrogen_ENABLE_CUTLASS
+  "Search for CUTLASS support and enable related features if found."
+  OFF)
+
+option(Hydrogen_ENABLE_NVSHMEM_GEMM
+  "Search for NVSHMEM-based GEMM support and enable related features if found."
+  OFF)
+
 if (Hydrogen_ENABLE_CUDA)
   option(Hydrogen_ENABLE_CUB
     "Search for CUB support and enable related features if found."
@@ -319,6 +327,14 @@ if (Hydrogen_ENABLE_HALF)
 endif ()
 
 if (Hydrogen_ENABLE_CUDA)
+
+  if (Hydrogen_ENABLE_CUTLASS)
+      set(HYDROGEN_HAVE_CUTLASS TRUE)
+  endif()
+
+  if (Hydrogen_ENABLE_NVSHMEM_GEMM)
+      set(HYDROGEN_HAVE_NVSHMEM_GEMM TRUE)
+  endif()
 
   include(CheckLanguage)
   check_language(CUDA)
@@ -515,9 +531,14 @@ target_link_libraries(Hydrogen_CXX PUBLIC ${HALF_LIBRARIES})
 if (TARGET OpenMP::OpenMP_CXX)
   target_link_libraries(Hydrogen_CXX PUBLIC OpenMP::OpenMP_CXX)
 endif ()
+
+set(NVSHMEM_HOME "/usr/workspace/wsb/brain/nvshmem/nvshmem_0.3/nvshmem_0.3.3-0+cuda10_ppc64le")
+link_directories(${NVSHMEM_HOME}/lib)
+
 target_link_libraries(Hydrogen_CXX PUBLIC MPI::MPI_CXX)
 target_link_libraries(Hydrogen_CXX PUBLIC LAPACK::lapack)
 target_link_libraries(Hydrogen_CXX PUBLIC EP::extended_precision)
+#target_link_libraries(Hydrogen_CXX PUBLIC nvshmem)
 
 target_link_libraries(Hydrogen_CXX PUBLIC ${VTUNE_LIBRARIES})
 target_link_libraries(Hydrogen_CXX PUBLIC ${NVTX_LIBRARIES})
@@ -528,16 +549,22 @@ endif ()
 # Add the CXX library to "Hydrogen"
 set(HYDROGEN_LIBRARIES Hydrogen_CXX)
 
+
 if (HYDROGEN_HAVE_CUDA)
   add_library(Hydrogen_CUDA "${HYDROGEN_CUDA_SOURCES}")
   target_include_directories(Hydrogen_CUDA PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
     $<INSTALL_INTERFACE:include>)
+  include_directories("/p/gpfs1/ayoo/cutlass-2.0/cutlass/include")
+# include_directories("/usr/workspace/wsb/brain/nvshmem/nvshmem_0.3/nvshmem_0.3.3-0+cuda10_ppc64le/include")
+  include_directories(${NVSHMEM_HOME}/include)
+  include_directories("/usr/tce/packages/spectrum-mpi/spectrum-mpi-rolling-release-gcc-7.3.1/include")
 
   target_link_libraries(Hydrogen_CUDA PUBLIC ${HALF_LIBRARIES})
   target_link_libraries(Hydrogen_CUDA PUBLIC ${NVTX_LIBRARIES})
   target_link_libraries(Hydrogen_CUDA PUBLIC cuda::toolkit)
+  target_link_libraries(Hydrogen_CUDA PUBLIC ${NVSHMEM_HOME}/lib/libnvshmem.a)
 
   list(APPEND HYDROGEN_LIBRARIES Hydrogen_CUDA)
 endif ()
@@ -668,6 +695,7 @@ if (NOT __dont_print_summary)
     HYDROGEN_HAVE_LAPACK
     HYDROGEN_HAVE_MKL
     HYDROGEN_HAVE_MKL_GEMMT
+    HYDROGEN_HAVE_CUTLASS
     EL_USE_64BIT_INTS
     EL_USE_64BIT_BLAS_INTS
     EL_ZERO_INIT
@@ -687,3 +715,4 @@ if (NOT __dont_print_summary)
   set(__dont_print_summary ON CACHE INTERNAL "" FORCE)
   # Only print the configuration on initial configuration
 endif ()
+

@@ -86,6 +86,12 @@ void LocalGemm
            const AbstractDistMatrix<T>& B,
                  AbstractDistMatrix<T>& C );
 
+void Gemm_float (Orientation orientA, Orientation orientB,
+  float alpha, const AbstractDistMatrix<float>& A,
+           const AbstractDistMatrix<float>& B,
+  float beta,        AbstractDistMatrix<float>& C,
+  GemmAlgorithm alg);
+
 // Hemm
 // ====
 template<typename T>

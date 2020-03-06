@@ -1,0 +1,88 @@
+template<typename T>
+void mcmr_to_vrstar(MPI_Comm mpi_comm,
+int m,
+int n,
+int grid_height,
+int grid_width,
+T* dev_B_buffer,
+
+)
+{
+#if HYDROGEN_HAVE_NVSHMEM_GEMM
+
+  	int grid_size = grid_height*grid_width;
+
+        int my_pe_rank;
+        int* dev_pes;
+        std::vector<int> pes;
+        int xnpes;
+        prepare_for_conversion(mpi_comm, &my_pe_rank, &dev_pes, pes, &xnpes);
+
+	int mcmr_local_height  = local_height_mcmr(my_pe_rank, m, n, grid_height, grid_width);
+	int mcmr_local_width   = local_width_mcmr(my_pe_rank, m, n, grid_height, grid_width);
+
+        std::vector<int> recv_counts(grid_size, 0);
+        std::vector<int> recv_displs(grid_size+1, 0);
+        for(int j=0; j<grid_width; j++){
+            int p = grid_row_rank(my_pe_rank, grid_height, grid_width)+j*grid_height;
+            recv_counts[p] = local_height_vcstar(my_pe_rank, m, n, grid_height, grid_width) * local_width_mcmr(p, m, n, grid_height, grid_width);
+        }
+        int total_recv =0;
+        for(int p=0; p<grid_size; p++)
+            total_recv += recv_counts[p];
+        recv_displs[0]  = 0;
+        for(int p=1; p<=grid_size; p++){
+            recv_displs[p] = recv_displs[p-1] + recv_counts[p-1];
+        }
+
+        T* dev_local_buffer = (T*) nvshmem_malloc(total_recv*sizeof(T));
+        CHECK_CUDA(cudaMemcpyAsync((void*) dev_local_buffer, (void const*) dev_B_buffer, 
+		(mcmr_local_height*mcmr_local_width*sizeof(T), cudaMemcpyDeviceToDevice, 0));
+        int workspace_size = grid_size;
+        int* common_workspace = (int*) nvshmem_malloc(workspace_size *sizeof(int));
+        CHECK_CUDA(cudaMemsetAsync(common_workspace, 0, workspace_size*sizeof(int), 0));
+
+    	convert_mcmr_to_vcstar<T> (m, n, my_pe_rank, grid_height, grid_width,
+        	dev_local_buffer,
+        	dev_pes,
+        	xnpes,
+        	common_workspace, 0);
+#if 0
+char line[132];
+sprintf(line, "__debug.%04d", my_pe_rank);
+FILE *fp_debug = fopen(line, "w");
+
+int local_size_vcstar = local_height_vcstar(my_pe_rank, m, n, grid_height, grid_width)*local_width_vcstar(my_pe_rank, m, n, grid_height, grid_width);
+
+std::vector<float> host_local_buffer(local_size_vcstar);
+CHECK_CUDA(cudaMemcpy(host_local_buffer.data(), dev_local_buffer, local_size_vcstar*sizeof(float), cudaMemcpyDeviceToHost));
+    fprintf(fp_debug, "[vc,star] ...\n");
+    for(int j=0; j<host_local_buffer.size(); j++){
+        fprintf(fp_debug, "%.8f ", host_local_buffer[j] );
+    }
+    fprintf(fp_debug, "\n");
+fprintf(fp_debug, "(%d) total_recv=%d\n", my_pe_rank, total_recv);
+#endif
+
+
+
+	convert_vcstar_to_vrstar_float(m, n, my_pe_rank, grid_height, grid_width,
+        dev_local_buffer,
+        dev_pes, xnpes,
+        common_workspace, 0);
+
+#if 0
+int local_size_vrstar = local_height_vrstar(my_pe_rank, m, n, grid_height, grid_width)*local_width_vrstar(my_pe_rank, m, n, grid_height, grid_width);
+	std::vector<float> host_vrstar_buffer(local_size_vrstar);
+	CHECK_CUDA(cudaMemcpy(host_vrstar_buffer.data(), dev_local_buffer, local_size_vrstar*sizeof(float), cudaMemcpyDeviceToHost));
+    fprintf(fp_debug, "[vr,star] ...\n");
+    for(int j=0; j<host_vrstar_buffer.size(); j++){
+        fprintf(fp_debug, "%.8f ", host_vrstar_buffer[j] );
+    }
+    fprintf(fp_debug, "\n");
+
+fclose(fp_debug);
+#endif
+
+#endif
+}

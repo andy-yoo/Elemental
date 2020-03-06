@@ -15,6 +15,14 @@
 #include "./Gemm/TN.hpp"
 #include "./Gemm/TT.hpp"
 
+#ifdef HYDROGEN_HAVE_CUDA
+#ifdef HYDROGEN_HAVE_CUTLASS
+#include "hydrogen/blas/cutlass_blas/cutlassBLAS.hpp"
+#endif
+#endif
+
+#include <vector>
+
 namespace El
 {
 
@@ -57,6 +65,18 @@ void Gemm(Orientation orientA, Orientation orientB,
     Gemm(orientA, orientB, alpha, A, B, T{0}, C);
 }
 
+
+void Gemm_float (Orientation orientA, Orientation orientB,
+  float alpha, const AbstractDistMatrix<float>& A,
+           const AbstractDistMatrix<float>& B,
+  float beta,        AbstractDistMatrix<float>& C,
+  GemmAlgorithm alg)
+{
+ Gemm<float> (orientA, orientB,
+  alpha, A, B, beta, C,
+  alg);
+}
+
 namespace
 {
 template <typename T>
@@ -90,8 +110,6 @@ static void Gemm_impl(
 {
     AUTO_PROFILE_REGION("Gemm_impl.GPU", SyncInfoFromMatrix(C));
 
-    auto const transA = OrientationToTransposeMode(orientA);
-    auto const transB = OrientationToTransposeMode(orientB);
     const Int m = C.Height();
     const Int n = C.Width();
     const Int k = (orientA == NORMAL ? A.Width() : A.Height());
@@ -100,10 +118,87 @@ static void Gemm_impl(
     auto SyncManager = MakeMultiSync(
         master_sync, SyncInfoFromMatrix(A), SyncInfoFromMatrix(B));
 
+#ifdef HYDROGEN_HAVE_CUTLASS
+    //gpu_cutlass_blas::Gemm: defined as template in ~/*_decl.hpp
+    // and ~/*_impl.hpp
+    // In ~/*_impl.hpp, also defined as a template, calls gpu_blas_cutlass_impl, which is 
+    // hydrogen::cublas
+    // But I dont have follow this framework
+    //
+    // Int is defined as either long long int (64 bit) or int (32 bit)
+
+/*
+char OrientationToChar( Orientation orientation )
+{
+    char orientationChar;
+    switch( orientation )
+    {
+        case NORMAL:    orientationChar = 'N'; break;
+        case TRANSPOSE: orientationChar = 'T'; break;
+        default:        orientationChar = 'C'; break;
+    }
+    return orientationChar;
+}
+*/
+
+/*
+std::vector<float> host_A(m*k,  0);
+cudaMemcpy(host_A.data(), A.LockedBuffer(), m*k*sizeof(float), cudaMemcpyDeviceToHost);
+printf("host_A\n");
+for( int j=0; j<(int)m*k; ++j ){
+	printf("%lf ", host_A[j]);
+}
+printf("\n");
+
+std::vector<float> host_B(k*n,  0);
+cudaMemcpy(host_B.data(), B.LockedBuffer(), m*k*sizeof(float), cudaMemcpyDeviceToHost);
+printf("host_B\n");
+for( int j=0; j<(int)m*n; ++j ){
+	printf("%lf ", host_B[j]);
+}
+printf("\n");
+
+   for( int i=0; i<(int)m; ++i )
+	printf("%f ", host_A[i+j*ldim]);
+const T* A_ptr=A.LockedBuffer();
+printf("A_ptr: m=%d n=%d ldim=%d\n", (int)m, (int)n, ldim);
+for( int j=0; j<(int)n; ++j ){
+   for( int i=0; i<(int)k; ++i )
+;//	printf("%f ", A_ptr[i+j*ldim]);
+   printf("\n");
+}
+*/
+//
+// printf("A_ptr: m=%d n=%d ldim=%d\n", (int)m, (int)n, lda);
+// for( int l=0; l<m*k; l++)
+//      printf("%f ", host_A[l]);
+//
+//
+
+    gpu_cutlass_blas::Gemm_cutlass<T> (OrientationToChar(orientA), OrientationToChar(orientB), 
+	       (int)m, (int)n, (int)k,
+               alpha, A.LockedBuffer(), A.LDim(),
+               B.LockedBuffer(), B.LDim(),
+               beta, C.Buffer(), C.LDim());
+
+/*
+std::vector<float> host_C(m*n,  0);
+cudaMemcpy(host_C.data(), C.LockedBuffer(), m*k*sizeof(float), cudaMemcpyDeviceToHost);
+printf("host_C\n");
+for( int j=0; j<(int)m*n; ++j ){
+	printf("%lf ", host_C[j]);
+}
+printf("\n");
+*/
+
+#else
+    auto const transA = OrientationToTransposeMode(orientA);
+    auto const transB = OrientationToTransposeMode(orientB);
     gpu_blas::Gemm(transA, transB, m, n, k,
                    alpha, A.LockedBuffer(), A.LDim(),
                    B.LockedBuffer(), B.LDim(),
                    beta, C.Buffer(), C.LDim(), master_sync);
+#endif
 }
 
 #endif // HYDROGEN_HAVE_CUDA

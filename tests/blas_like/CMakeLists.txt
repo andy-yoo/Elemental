@@ -8,6 +8,7 @@ set_full_path(THIS_DIR_SOURCES
   Gemm.cpp
   Gemv.cpp
   Hadamard.cpp
+#  TestGemm.cpp
 #  MaxAbs.cpp
 #  MultiShiftQuasiTrsm.cpp
 #  MultiShiftTrsm.cpp

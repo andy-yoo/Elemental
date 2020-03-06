@@ -1,13 +1,25 @@
 /*
   Copyright (c) 2009-2016, Jack Poulson
   All rights reserved.
-
   This file is part of Elemental and is under the BSD 2-Clause License,
   which can be found in the LICENSE file in the root directory, or at
   http://opensource.org/licenses/BSD-2-Clause
 */
 #include <El.hpp>
 using namespace El;
+
+
+#include <hydrogen/blas/nvshmem_gemm/DataRedistribution.hpp>
+#include <hydrogen/blas/nvshmem_gemm/NVSHMEM_Gemm.hpp>
+
+#include <mpi.h>
+#include <nvshmem.h>
+#include <nvshmemx.h>
+
+#define NUM_ITERS	0
+#define NUM_RUNS	1
+//#define NUM_ITERS	500
+//#define NUM_RUNS	1000
 
 template<typename T, Device D>
 void TestAssociativity
@@ -65,7 +77,8 @@ void TestAssociativity
         realGFlops = 2.*double(m)*double(n)*double(k)/(1.e9*runTime);   \
         gFlops = (IsComplex<T>::value ? 4*realGFlops : realGFlops);     \
         OutputFromRoot(g.Comm(),"Finished in ",runTime,                 \
-                     " seconds (",gFlops," GFlop/s)");                  \
+                     " seconds (",gFlops," GFlop/s)",			\
+		     " Num. Iterations is ", NUM_RUNS);                  \
     }
 
 #else
@@ -86,7 +99,7 @@ void TestGemm
  Int colAlignB=0, Int rowAlignB=0,
  Int colAlignC=0, Int rowAlignC=0)
 {
-  OutputFromRoot(g.Comm(),"Testing with ",TypeName<T>());
+    OutputFromRoot(g.Comm(),"Testing with ",TypeName<T>());
     PushIndent();
 
     double runTime, realGFlops, gFlops;
@@ -105,10 +118,57 @@ void TestGemm
     else
         Uniform(B, n, k, TypeTraits<T>::Zero(), TypeTraits<Base<T>>::One());
     Uniform(COrig, m, n, TypeTraits<T>::Zero(), TypeTraits<Base<T>>::One());
+
     if (print)
     {
         Print(A, "A");
         Print(B, "B");
+
+#if 0
+/*
+    int my_row_rank = g.Row();
+    int my_col_rank = g.Col();
+    int myrank = g.Rank();
+    int grid_height = g.Height();
+    int grid_width = g.Width();
+    int grid_size = g.Size();
+
+    char line[132];
+    sprintf(line, "debug.%04d", myrank);
+    FILE *fp_debug = fopen(line, "w");
+    int local_height = B.LocalHeight();
+    int local_width = B.LocalWidth();
+
+    Matrix<T, D>& local_mat = B.Matrix();
+    for(int i=0; i<local_height; i++){
+          for(int j=0; j<local_width; j++)
+             fprintf(fp_debug, "%f ", (T) local_mat.Get(i,j));
+          fprintf(fp_debug, "\n");
+    }
+
+    auto kernel_B_buffer = local_mat.Buffer();
+    auto B_buffer = local_mat.Buffer();
+    T* mem_buffer = (T*) malloc(local_height*local_width*sizeof(T));
+    cudaMemcpy(mem_buffer, B_buffer, local_height*local_width*sizeof(T), cudaMemcpyDeviceToHost);
+
+    fprintf(fp_debug, "rank: %d\tLocal_Height=%d Local_Width=%d\n", myrank, local_mat.Height(), local_mat.Width());
+    fprintf(fp_debug, "Buffer of B...\n");
+    for(int j=0; j<local_height*local_width; j++){
+        fprintf(fp_debug, "%f ", (T) mem_buffer[j]);
+    }
+    fprintf(fp_debug, "\n");
+*/
+
+    printf( "rank: %d\tLocal_Height=%d Local_Width=%d\n", myrank, local_mat.Height(), local_mat.Width());
+    for(int i=0; i<local_height; i++){
+          for(int j=0; j<local_width; j++)
+             printf( "%f ", (T) local_mat.Get(i,j));
+          printf( "\n");
+    }
+    fclose(fp_debug);
+#endif
+
+
         Print(COrig, "COrig");
     }
 
@@ -120,14 +180,18 @@ void TestGemm
     float cudaTime;
 #endif
 
+/*
     // Test the variant of Gemm that keeps A stationary
     C = COrig;
     OutputFromRoot(g.Comm(),"Stationary A algorithm:");
     PushIndent();
     mpi::Barrier(g.Comm());
+    for(int repeat=0; repeat<NUM_ITERS; repeat++)
+        Gemm(orientA, orientB, alpha, A, B, beta, C, GEMM_SUMMA_A);
     timer.Start();
     START_CUDA_TIMER;
-    Gemm(orientA, orientB, alpha, A, B, beta, C, GEMM_SUMMA_A);
+    for(int repeat=0; repeat<NUM_RUNS; repeat++)
+        Gemm(orientA, orientB, alpha, A, B, beta, C, GEMM_SUMMA_A);
     STOP_CUDA_TIMER;
 
     mpi::Barrier(g.Comm());
@@ -144,7 +208,9 @@ void TestGemm
     if (correctness)
         TestAssociativity(orientA, orientB, alpha, A, B, beta, COrig, C, print);
     PopIndent();
+*/
 
+ /*
     // Test the variant of Gemm that keeps B stationary
     C = COrig;
     OutputFromRoot(g.Comm(),"Stationary B Algorithm:");
@@ -170,15 +236,20 @@ void TestGemm
     if (correctness)
         TestAssociativity(orientA, orientB, alpha, A, B, beta, COrig, C, print);
     PopIndent();
+*/
 
     // Test the variant of Gemm that keeps C stationary
     C = COrig;
     OutputFromRoot(g.Comm(),"Stationary C Algorithm:");
     PushIndent();
     mpi::Barrier(g.Comm());
+    for(int repeat=0; repeat<NUM_ITERS; repeat++)
+        Gemm(orientA, orientB, alpha, A, B, beta, C, GEMM_SUMMA_C);
+    mpi::Barrier(g.Comm());
     timer.Start();
     START_CUDA_TIMER;
-    Gemm(orientA, orientB, alpha, A, B, beta, C, GEMM_SUMMA_C);
+    for(int repeat=0; repeat<NUM_RUNS; repeat++)
+        Gemm(orientA, orientB, alpha, A, B, beta, C, GEMM_SUMMA_C);
     STOP_CUDA_TIMER;
 
     mpi::Barrier(g.Comm());
@@ -196,6 +267,8 @@ void TestGemm
             (orientA, orientB, alpha, A, B, beta, COrig, C, print);
     PopIndent();
 
+
+/*
     if (orientA == NORMAL && orientB == NORMAL)
     {
         // Test the variant of Gemm for panel-panel dot products
@@ -225,6 +298,8 @@ void TestGemm
                 (orientA, orientB, alpha, A, B, beta, COrig, C, print);
         PopIndent();
     }
+*/
+
     PopIndent();
 #ifdef HYDROGEN_HAVE_CUDA
     cudaEventDestroy(start);
@@ -276,30 +351,31 @@ main(int argc, char* argv[])
 #ifdef HYDROGEN_HAVE_CUDA
         if (testGPU)
         {
-#ifdef HYDROGEN_GPU_USE_FP16
-            TestGemm<gpu_half_type,Device::GPU>
-                (orientA, orientB,
-                 m, n, k,
-                 gpu_half_type(3.f), gpu_half_type(4.f),
-                 g,
-                 print, correctness,
-                 colAlignA, rowAlignA,
-                 colAlignB, rowAlignB,
-                 colAlignC, rowAlignC);
-#endif // HYDROGEN_GPU_USE_FP16
+    MPI_Comm mpi_comm = MPI_COMM_WORLD;
+    nvshmemx_init_attr_t attr;
+    int mype, npes;
+    int mype_node;
+
+    attr.mpi_comm = &mpi_comm;
+    nvshmemx_init_attr (NVSHMEMX_INIT_WITH_MPI_COMM, &attr);
+
+    mype = nvshmemx_my_pe(NVSHMEMX_TEAM_WORLD);
+    npes = nvshmemx_n_pes(NVSHMEMX_TEAM_WORLD);
+    mype_node = nvshmemx_my_pe(NVSHMEMX_TEAM_NODE);
+
+    int dev_count;
+    cudaGetDeviceCount(&dev_count);
+    cudaSetDevice(mype_node%dev_count);
+
+    cudaStream_t stream;
+    CHECK_CUDA( cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+
+
             TestGemm<float,Device::GPU>
                 (orientA, orientB,
                  m, n, k,
-                 float(3), float(4),
-                 g,
-                 print, correctness,
-                 colAlignA, rowAlignA,
-                 colAlignB, rowAlignB,
-                 colAlignC, rowAlignC);
-            TestGemm<double,Device::GPU>
-                (orientA, orientB,
-                 m, n, k,
-                 double(3), double(4),
+//                 float(3), float(4),
+                 float(1.f), float(0.f),
                  g,
                  print, correctness,
                  colAlignA, rowAlignA,
@@ -311,137 +387,6 @@ main(int argc, char* argv[])
 #endif
         if (testCPU)
         {
-            TestGemm<float,Device::CPU>
-                (orientA, orientB,
-                 m, n, k,
-                 float(3), float(4),
-                 g,
-                 print, correctness,
-                 colAlignA, rowAlignA,
-                 colAlignB, rowAlignB,
-                 colAlignC, rowAlignC);
-            TestGemm<Complex<float>,Device::CPU>
-                (orientA, orientB,
-                 m, n, k,
-                 Complex<float>(3), Complex<float>(4),
-                 g,
-                 print, correctness,
-                 colAlignA, rowAlignA,
-                 colAlignB, rowAlignB,
-                 colAlignC, rowAlignC);
-
-            TestGemm<double,Device::CPU>
-                (orientA, orientB,
-                 m, n, k,
-                 double(3), double(4),
-                 g,
-                 print, correctness,
-                 colAlignA, rowAlignA,
-                 colAlignB, rowAlignB,
-                 colAlignC, rowAlignC);
-            TestGemm<Complex<double>,Device::CPU>
-                (orientA, orientB,
-                 m, n, k,
-                 Complex<double>(3), Complex<double>(4),
-                 g,
-                 print, correctness,
-                 colAlignA, rowAlignA,
-                 colAlignB, rowAlignB,
-                 colAlignC, rowAlignC);
-
-#ifdef EL_HAVE_QD
-            TestGemm<DoubleDouble,Device::CPU>
-                (orientA, orientB,
-                 m, n, k,
-                 DoubleDouble(3), DoubleDouble(4),
-                 g,
-                 print, correctness,
-                 colAlignA, rowAlignA,
-                 colAlignB, rowAlignB,
-                 colAlignC, rowAlignC);
-            TestGemm<QuadDouble,Device::CPU>
-                (orientA, orientB,
-                 m, n, k,
-                 QuadDouble(3), QuadDouble(4),
-                 g,
-                 print, correctness,
-                 colAlignA, rowAlignA,
-                 colAlignB, rowAlignB,
-                 colAlignC, rowAlignC);
-
-            TestGemm<Complex<DoubleDouble>,Device::CPU>
-                (orientA, orientB,
-                 m, n, k,
-                 Complex<DoubleDouble>(3), Complex<DoubleDouble>(4),
-                 g,
-                 print, correctness,
-                 colAlignA, rowAlignA,
-                 colAlignB, rowAlignB,
-                 colAlignC, rowAlignC);
-            TestGemm<Complex<QuadDouble>,Device::CPU>
-                (orientA, orientB,
-                 m, n, k,
-                 Complex<QuadDouble>(3), Complex<QuadDouble>(4),
-                 g,
-                 print, correctness,
-                 colAlignA, rowAlignA,
-                 colAlignB, rowAlignB,
-                 colAlignC, rowAlignC);
-#endif
-
-#ifdef HYDROGEN_HAVE_HALF
-            TestGemm<cpu_half_type,Device::CPU>
-                (orientA, orientB,
-                 m, n, k,
-                 cpu_half_type(3), cpu_half_type(4),
-                 g,
-                 print, correctness,
-                 colAlignA, rowAlignA,
-                 colAlignB, rowAlignB,
-                 colAlignC, rowAlignC);
-#endif
-
-#ifdef EL_HAVE_QUAD
-            TestGemm<Quad,Device::CPU>
-                (orientA, orientB,
-                 m, n, k,
-                 Quad(3), Quad(4),
-                 g,
-                 print, correctness,
-                 colAlignA, rowAlignA,
-                 colAlignB, rowAlignB,
-                 colAlignC, rowAlignC);
-            TestGemm<Complex<Quad>,Device::CPU>
-                (orientA, orientB,
-                 m, n, k,
-                 Complex<Quad>(3), Complex<Quad>(4),
-                 g,
-                 print, correctness,
-                 colAlignA, rowAlignA,
-                 colAlignB, rowAlignB,
-                 colAlignC, rowAlignC);
-#endif
-
-#ifdef EL_HAVE_MPC
-            TestGemm<BigFloat,Device::CPU>
-                (orientA, orientB,
-                 m, n, k,
-                 BigFloat(3), BigFloat(4),
-                 g,
-                 print, correctness,
-                 colAlignA, rowAlignA,
-                 colAlignB, rowAlignB,
-                 colAlignC, rowAlignC);
-            TestGemm<Complex<BigFloat>,Device::CPU>
-                (orientA, orientB,
-                 m, n, k,
-                 Complex<BigFloat>(3), Complex<BigFloat>(4),
-                 g,
-                 print, correctness,
-                 colAlignA, rowAlignA,
-                 colAlignB, rowAlignB,
-                 colAlignC, rowAlignC);
-#endif
         }
         //}
     //catch(exception& e) { ReportException(e); }

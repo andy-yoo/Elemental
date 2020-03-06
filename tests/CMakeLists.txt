@@ -2,6 +2,8 @@
 add_subdirectory(blas_like)
 add_subdirectory(core)
 #add_subdirectory(lapack_like)
+set(NVSHMEM_HOME "/usr/workspace/wsb/brain/nvshmem/nvshmem_0.3/nvshmem_0.3.3-0+cuda10_ppc64le")
+link_directories(${NVSHMEM_HOME}/lib)
 
 foreach (src_file ${SOURCES})
 
@@ -10,6 +12,7 @@ foreach (src_file ${SOURCES})
   # Create the executable
   add_executable("${__test_name}" ${src_file})
   target_link_libraries("${__test_name}" PRIVATE ${HYDROGEN_LIBRARIES})
+  #target_link_libraries("${__test_name}" nvshmem)
 
   # Create test
   add_test(NAME "${__test_name}.test"
