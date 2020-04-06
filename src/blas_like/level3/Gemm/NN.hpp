@@ -6,8 +6,12 @@
    which can be found in the LICENSE file in the root directory, or at
    http://opensource.org/licenses/BSD-2-Clause
 */
+#include <El.hpp>
+
+#include <sys/time.h>
 #include <hydrogen/blas/nvshmem_gemm/DataRedistribution.hpp>
 #include <hydrogen/blas/nvshmem_gemm/NVSHMEM_Gemm.hpp>
+
 
 namespace El {
 namespace gemm {
@@ -157,7 +161,8 @@ void SUMMA_NNA_impl
 
             
     	    
-#ifdef HYDROGEN_HAVE_NVSHMEM_GEMM
+//#ifdef HYDROGEN_HAVE_NVSHMEM_GEMM
+#if 0
 	int B1_Height = B1.Height();
 	int B1_Width = B1.Width();
 	int B1_LocalHeight = B1.LocalHeight();
@@ -175,17 +180,6 @@ void SUMMA_NNA_impl
         Matrix<T, D>& local_mat = B1.Matrix();
         auto B1_buffer = local_mat.Buffer();
 
-/*
-   	struct cudaPointerAttributes attr;
-	cudaPointerGetAttributes(&attr, (const void*) B1_buffer);
-	if (attr.type == cudaMemoryTypeHost)
-	   printf("dev b1 buffer on Host..\n");
-	else if (attr.type == cudaMemoryTypeDevice)
-	   printf("dev b1 buffer on device..\n");
-	else
-	   printf("dev b1 buffer on host..\n");
-*/
-
 	B1_VR_STAR.Resize(B1_Height, B1_Width);
 	
 	// Now do B1_VR_STAR = B1 using B1_buffer
@@ -199,127 +193,6 @@ void SUMMA_NNA_impl
         	B1_buffer,
 		B1_VR_STAR_buffer,
 		stream);
-
-#if 1
-
-/*
-int b1_vr_star_local_height = B1_VR_STAR.LocalHeight();
-int b1_vr_star_local_width = B1_VR_STAR.LocalWidth();
-char line[132];
-sprintf(line, "___final.%04d", myrank);
-FILE *fp_debug = fopen(line, "w");
-int local_size_vrstar = b1_vr_star_local_height*b1_vr_star_local_width;
-
-Matrix<T, D>& local_vrstar = B1_VR_STAR.Matrix();
-auto B1VRSTAR_buffer = local_vrstar.Buffer();
-std::vector<T> host_vrstar_buffer(local_size_vrstar);
-CHECK_CUDA(cudaMemcpy(host_vrstar_buffer.data(), B1VRSTAR_buffer, local_size_vrstar*sizeof(T), cudaMemcpyDeviceToHost));
-    fprintf(fp_debug, "[vr,star] ...\n");
-    for(int j=0; j<host_vrstar_buffer.size(); j++){
-        fprintf(fp_debug, "%.8f ", (T) host_vrstar_buffer[j] );
-    }
-    fprintf(fp_debug, "\n");
-
-fclose(fp_debug);
-*/
-
-#if 0
-        int my_pe_rank;
-        int* dev_pes;
-        std::vector<int> pes;
-        int xnpes;
-        prepare_for_conversion(mpi_comm, &my_pe_rank, &dev_pes, pes, &xnpes);
-
-        std::vector<int> recv_counts(grid_size, 0);
-        std::vector<int> recv_displs(grid_size+1, 0);
-        for(int j=0; j<grid_width; j++){
-            int p = grid_row_rank(myrank, grid_height, grid_width)+j*grid_height;
-            recv_counts[p] = local_height_vcstar(myrank, m_p, n_p, grid_height, grid_width) * local_width_mcmr(p, m_p, n_p, grid_height, grid_width);
-        }
-        int total_recv =0;
-        for(int p=0; p<grid_size; p++)
-            total_recv += recv_counts[p];
-        recv_displs[0]  = 0;
-        for(int p=1; p<=grid_size; p++){
-            recv_displs[p] = recv_displs[p-1] + recv_counts[p-1];
-        }
-
-        T* dev_local_buffer = (T*) nvshmem_malloc(total_recv*sizeof(T));
-            int* common_workspace = (int*) nvshmem_malloc(32 *sizeof(int));
-    	convert_mcmr_to_vcstar<T> (m_p, n_p, my_pe_rank, grid_height, grid_width,
-        	dev_local_buffer,
-        	dev_pes,
-        	xnpes,
-        	common_workspace, 0);
-	if(std::is_same<T, float>::value){
-            float* dev_local_buffer = (float*) nvshmem_malloc(total_recv*sizeof(float));
-            CHECK_CUDA(cudaMemcpyAsync((void*) dev_local_buffer, (void const*) dev_B1_buffer, 
-		(B1_LocalHeight*B1_LocalWidth)*sizeof(float), cudaMemcpyDeviceToDevice, 0));
-
-            int workspace_size = 32, dev_pes_size = 32;
-            int* common_workspace;
-            common_workspace = (int*) nvshmem_malloc(workspace_size*sizeof(int));
-
-            CHECK_CUDA(cudaMemsetAsync(common_workspace, 0, workspace_size*sizeof(int), 0));
-
-    	    //convert_mcmr_to_vcstar<T> (m_p, n_p, my_pe_rank, grid_height, grid_width,
-    	    convert_mcmr_to_vcstar_float (m_p, n_p, my_pe_rank, grid_height, grid_width,
-        	dev_local_buffer,
-        	dev_pes,
-        	xnpes,
-        	common_workspace, 0);
-
-char line[132];
-sprintf(line, "__debug.%04d", my_pe_rank);
-FILE *fp_debug = fopen(line, "w");
-
-int local_size_vcstar = local_height_vcstar(my_pe_rank, m_p, n_p, grid_height, grid_width)*local_width_vcstar(my_pe_rank, m_p, n_p, grid_height, grid_width);
-
-std::vector<float> host_local_buffer(local_size_vcstar);
-CHECK_CUDA(cudaMemcpy(host_local_buffer.data(), dev_local_buffer, local_size_vcstar*sizeof(float), cudaMemcpyDeviceToHost));
-    fprintf(fp_debug, "[vc,star] ...\n");
-    for(int j=0; j<host_local_buffer.size(); j++){
-        fprintf(fp_debug, "%.8f ", host_local_buffer[j] );
-    }
-    fprintf(fp_debug, "\n");
-fprintf(fp_debug, "(%d) total_recv=%d\n", my_pe_rank, total_recv);
-
-
-int local_size_vrstar = local_height_vrstar(my_pe_rank, m_p, n_p, grid_height, grid_width)*local_width_vrstar(my_pe_rank, m_p, n_p, grid_height, grid_width);
-
-	convert_vcstar_to_vrstar_float(m_p, n_p, my_pe_rank, grid_height, grid_width,
-        dev_local_buffer,
-        dev_pes, xnpes,
-        common_workspace, 0);
-
-	std::vector<float> host_vrstar_buffer(local_size_vcstar);
-	CHECK_CUDA(cudaMemcpy(host_vrstar_buffer.data(), dev_local_buffer, local_size_vcstar*sizeof(float), cudaMemcpyDeviceToHost));
-    fprintf(fp_debug, "[vr,star] ...\n");
-    for(int j=0; j<host_vrstar_buffer.size(); j++){
-        fprintf(fp_debug, "%.8f ", host_vrstar_buffer[j] );
-    }
-    fprintf(fp_debug, "\n");
-
-fclose(fp_debug);
-
-        B1_VR_STAR = B1;
-/*
-            B1_VC_STAR = B1;
-            Matrix<float, D>& vcstar_mat = B1_VC_STAR.Matrix();
-
-    auto local_mat = B1_VC_STAR.Matrix();
-    auto kernel_B_buffer = local_mat.Buffer();
-
-    int memsize = B1_VC_STAR.Height()*B1_VC_STAR.Width();
-    std::vector<float> host_mem_buffer(memsize);
-    cudaMemcpy(host_mem_buffer.data(), kernel_B_buffer, memsize*sizeof(float), cudaMemcpyDeviceToHost);
-
-*/
-	}
-	else
-            B1_VR_STAR = B1;
-#endif
-#endif
 #else
         B1_VR_STAR = B1;
 #endif
@@ -462,6 +335,7 @@ void SUMMA_NNC_impl(T alpha,
     const Int sumDim = APre.Width();
     const Int bsize = Blocksize();
     const Grid& g = APre.Grid();
+    const Int BsumDim = BPre.Width();
 
     DistMatrixReadProxy<T,T,MC,MR,ELEMENT,D> AProx(APre);
     DistMatrixReadProxy<T,T,MC,MR,ELEMENT,D> BProx(BPre);
@@ -477,60 +351,378 @@ void SUMMA_NNC_impl(T alpha,
     A1_MC_STAR.AlignWith(C);
     B1Trans_MR_STAR.AlignWith(C);
 
+
     for(Int k=0; k<sumDim; k+=bsize)
     {
         const Int nb = Min(bsize,sumDim-k);
         auto A1 = A(ALL,        IR(k,k+nb));
         auto B1 = B(IR(k,k+nb), ALL       );
 
+        A1_MC_STAR = A1;
+
+        Transpose(B1, B1Trans_MR_STAR);
+        LocalGemm
+        (NORMAL, TRANSPOSE, alpha, A1_MC_STAR, B1Trans_MR_STAR, TypeTraits<T>::One(), C);
+     }
+}
+
+
+template <Device D, typename T, typename=EnableIf<IsDeviceValidType<T,D>>>
+void SUMMA_NNC_impl(float *run_timer,
+    		    cudaEvent_t kernel_start, 
+		    cudaEvent_t kernel_stop,
+		    T alpha,
+                    AbstractDistMatrix<T> const& APre,
+                    AbstractDistMatrix<T> const& BPre,
+                    AbstractDistMatrix<T>& CPre)
+{
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    EL_DEBUG_CSE
+    AUTO_PROFILE_REGION(
+        "SUMMA.NNC",
+        SyncInfoFromMatrix(
+            static_cast<Matrix<T,D> const&>(CPre.LockedMatrix())));
+    const Int sumDim = APre.Width();
+    const Int bsize = Blocksize();
+    const Grid& g = APre.Grid();
+    const Int BsumDim = BPre.Width();
+
+    DistMatrixReadProxy<T,T,MC,MR,ELEMENT,D> AProx(APre);
+    DistMatrixReadProxy<T,T,MC,MR,ELEMENT,D> BProx(BPre);
+    DistMatrixReadWriteProxy<T,T,MC,MR,ELEMENT,D> CProx(CPre);
+    auto& A = AProx.GetLocked();
+    auto& B = BProx.GetLocked();
+    auto& C = CProx.Get();
+
+
+    cudaStream_t stream;
+    if (APre.GetLocalDevice() == El::Device::GPU)
+       stream = static_cast<El::Matrix<T, El::Device::GPU> const&>(APre.LockedMatrix()).Stream();
+
+    // Temporary distributions
+    DistMatrix<T,MC,STAR,ELEMENT,D> A1_MC_STAR(g);
+    DistMatrix<T,MR,STAR,ELEMENT,D> B1Trans_MR_STAR(g);
+    DistMatrix<T,MC,MR,ELEMENT,D> B1_MCMR(g);
+    DistMatrix<T,MC,MR,ELEMENT,D> A1_MCMR(g);
+
+    A1_MC_STAR.AlignWith(C);
+    B1Trans_MR_STAR.AlignWith(C);
+    B1_MCMR.AlignWith(C);
+
+
+//#ifdef HYDROGEN_HAVE_NVSHMEM_GEMM
+
+    char* env_string;
+    int alg; // 0=Vanilla, 1=NVSHMEM
+    env_string = getenv ("EXP_ALG");
+    if (env_string !=NULL)
+      alg = atoi(env_string);
+
+    float cudaTime;
+if(alg ==  0){
+char line[132];
+FILE *fp_debug;
+    MPI_Comm mpi_comm;
+    mpi::Comm const& comm__ = g.Comm();
+    mpi_comm = comm__.GetMPIComm();
+
+int mpi_myrank;
+MPI_Comm_rank(mpi_comm, &mpi_myrank);
+sprintf(line, "vanilla.%04d", mpi_myrank);
+FILE* fp_probe = fopen(line, "a");
+
+    for(Int k=0; k<sumDim; k+=bsize)
+    {
+        const Int nb = Min(bsize,sumDim-k);
+        auto A1 = A(ALL,        IR(k,k+nb));
+        auto B1 = B(IR(k,k+nb), ALL       );
+
+    cudaEventRecord(start, stream  );
+        A1_MC_STAR = A1;
+    cudaEventRecord(stop, stream  );
+    cudaEventSynchronize(stop);                     \
+    cudaEventElapsedTime(&cudaTime, start, stop);   \
+    fprintf(fp_probe, "Alpha1: %f\n", cudaTime);
+    *run_timer += cudaTime;
+
+    cudaEventRecord(start, stream  );
+        Transpose(B1, B1Trans_MR_STAR);
+    cudaEventRecord(stop, stream  );
+    cudaEventSynchronize(stop);                     \
+    cudaEventElapsedTime(&cudaTime, start, stop);   \
+    fprintf(fp_probe, "Alpha2: %f\n", cudaTime);
+    *run_timer += cudaTime;
+
+    cudaEventRecord(start, stream  );
+        LocalGemm
+        (NORMAL, TRANSPOSE, alpha, A1_MC_STAR, B1Trans_MR_STAR, TypeTraits<T>::One(), C);
+    cudaEventRecord(kernel_stop, stream  );
+    cudaEventSynchronize(kernel_stop);                     \
+    cudaEventElapsedTime(&cudaTime, start, kernel_stop);   \
+    fprintf(fp_probe, "Alpha3: %f\n", cudaTime);
+    *run_timer += cudaTime;
+    }
+
+fclose(fp_probe);
+}
+else{
+
+
+    int my_row_rank = g.Row();
+    int my_col_rank = g.Col();
+    int myrank = g.Rank();
+    int grid_height = g.Height();
+    int grid_width = g.Width();
+    int grid_size = g.Size();
+
+    MPI_Comm mpi_comm;
+    mpi::Comm const& comm__ = g.Comm();
+    mpi_comm = comm__.GetMPIComm();
+
+    int my_pe_rank;
+    int xnpes;
+    int* common_workspace;
+    int* dev_pes;
+    T* dev_recv_buf;
+    T* dev_send_buf;
+    int A_width = (sumDim < bsize)?sumDim:bsize;
+
+    int B_my_pe_rank;
+    int B_xnpes;
+    int* B_common_workspace;
+    int* B_dev_pes;
+    int* B_dev_sync_counter;
+    T* B_dev_recv_buf;
+    T* B_dev_send_buf;
+    int B_width = (BsumDim < bsize)?BsumDim:bsize;
+
+char line[132];
+FILE *fp_debug;
+
+int mpi_myrank;
+MPI_Comm_rank(mpi_comm, &mpi_myrank);
+sprintf(line, "__elapsed.%04d", mpi_myrank);
+fp_debug = fopen(line, "w");
+
+sprintf(line, "nvshmem.%04d", mpi_myrank);
+FILE* fp_probe = fopen(line, "a");
+
+    int sync_counter = 0;
+    NVSHMEM_mcmr_to_mcstar_setup(
+	mpi_comm,
+        A.Height(), 
+	A_width,
+        grid_height,
+        grid_width,
+        &my_pe_rank,
+        &xnpes,
+        &common_workspace,
+        &dev_pes,
+        &dev_recv_buf,
+        &dev_send_buf);
+
+    NVSHMEM_mcmr_to_mrstar_setup(
+	mpi_comm,
+        B.Height(), 
+	B_width,
+        grid_height,
+        grid_width,
+        &B_my_pe_rank,
+        &B_xnpes,
+        &B_common_workspace,
+        &B_dev_pes,
+        &B_dev_sync_counter,
+        &B_dev_recv_buf,
+        &B_dev_send_buf);
+
+
+    for(Int k=0; k<sumDim; k+=bsize)
+    {
+        const Int nb = Min(bsize,sumDim-k);
+        auto A1 = A(ALL,        IR(k,k+nb));
+        auto B1 = B(IR(k,k+nb), ALL       );
+
+/*
+        Copy (A1, A1_MCMR);
+	Matrix<T, D>& local_a1mcmr_mat = A1_MCMR.Matrix();
+        auto A1_MCMR_buffer = local_a1mcmr_mat.Buffer();
+	std::vector<T> host_a1mcmr_buffer(A1.LocalHeight()*A1.LocalWidth());
+	CHECK_CUDA(cudaMemcpy(host_a1mcmr_buffer.data(), A1_MCMR_buffer, A1.LocalHeight()*A1.LocalWidth()*sizeof(T), cudaMemcpyDeviceToHost));
+	//std::vector<T> host_a1mcmr_buffer(A1_MCMR.LocalHeight()*A1_MCMR.LocalWidth());
+	//CHECK_CUDA(cudaMemcpy(host_a1mcmr_buffer.data(), A1_MCMR_buffer, A1_MCMR.LocalHeight()*A1_MCMR.LocalWidth()*sizeof(T), cudaMemcpyDeviceToHost));
+    fprintf(fp_debug, "A1[mc,mr]   ...\n");
+    for(int j=0; j<host_a1mcmr_buffer.size(); j++){
+        fprintf(fp_debug, "%f ", (T) host_a1mcmr_buffer[j]);
+    }
+    fprintf(fp_debug, "\n");
+*/
+/*
+fprintf(fp_debug, "== A1.height=%d A1.width=%d\n", A1.Height(), A1.Width());
+fprintf(fp_debug, "== A1.Localheight=%d A1.Localwidth=%d\n", A1.LocalHeight(), A1.LocalWidth());
+fprintf(fp_debug, "== B1.height=%d B1.width=%d\n", B1.Height(), B1.Width());
+fprintf(fp_debug, "== B1.Localheight=%d B1.Localwidth=%d\n", B1.LocalHeight(), B1.LocalWidth());
+
+std::vector<T> host_b1_buffer(B1.LocalHeight()*B1.LocalWidth());
+CHECK_CUDA(cudaMemcpy(host_b1_buffer.data(), B1_buffer, B1.LocalHeight()*B1.LocalWidth()*sizeof(T), cudaMemcpyDeviceToHost));
+fprintf(fp_debug, "B1[mc,mr] \n");
+for(int j=0; j<host_b1_buffer.size(); j++){
+        fprintf(fp_debug, "%f ", (T) host_b1_buffer[j] );
+}
+fprintf(fp_debug, "\n");
+fprintf(fp_debug, "B1[I,J]\n");
+for(int i=0; i<B1.Height(); i++){
+   for(int j=0; j<B1.Width(); j++)
+        fprintf(fp_debug, "%f ", (T) B1.Get(i, j));
+   fprintf(fp_debug, "\n");
+}
+*/
+
         // C[MC,MR] += alpha A1[MC,*] (B1^T[MR,*])^T
         //           = alpha A1[MC,*] B1[*,MR]
-//#ifdef HYDROGEN_HAVE_NVSHMEM_GEMM
-#if 0
 	int A1_Height = A1.Height();
 	int A1_Width = A1.Width();
 	int A1_LocalHeight = A1.LocalHeight();
 	int A1_LocalWidth = A1.LocalWidth();
 	int A1_LDim= A1.LDim();
 
- 	int m_p = C.Height();
-	int n_p = C.Width();
-	int k_p = nb;
-    
-        MPI_Comm mpi_comm;
-        mpi::Comm const& comm__ = g.Comm();
-        mpi_comm = comm__.GetMPIComm();
-
         Matrix<T, D>& local_mat = A1.Matrix();
         auto A1_buffer = local_mat.Buffer();
 
-	A1_VR_STAR.Resize(A1_Height, A1_Width);
+
+/*
+std::vector<T> host_a1_buffer(A1.LocalHeight()*A1.LocalWidth());
+CHECK_CUDA(cudaMemcpy(host_a1_buffer.data(), A1_buffer, A1.LocalHeight()*A1.LocalWidth()*sizeof(T), cudaMemcpyDeviceToHost));
+for(int j=0; j<host_a1_buffer.size(); j++){
+        fprintf(fp_debug, "%f ", (T) host_a1_buffer[j] );
+}
+fprintf(fp_debug, "\n");
+*/
+
+	A1_MC_STAR.Resize(A1_Height, A1_Width);
 	
 	// Now do A1_MC_STAR = A1; using A1_buffer
-        Matrix<T, D>& local_vc_star_mat = A1_MC_STAR.Matrix();
-        auto A1_MC_STAR_buffer = local_vc_star_mat.Buffer();
+        Matrix<T, D>& local_mc_star_mat = A1_MC_STAR.Matrix();
+        auto A1_MC_STAR_buffer = local_mc_star_mat.Buffer();
 
-	mcmr_to_vcstar (mpi_comm,
+#if 1
+    cudaEventRecord(start, stream  );
+	mcmr_to_mcstar(mpi_comm,
+		run_timer,
+		kernel_start,
+		kernel_stop,
+		sync_counter,
         	A1_Height, A1_Width,
         	grid_height,
         	grid_width,
+        my_pe_rank,
+        common_workspace,
+        dev_pes,
+        xnpes,
+        dev_send_buf,
+        dev_recv_buf,
         	A1_buffer,
+        	//A1_MCMR_buffer,
 		A1_MC_STAR_buffer,
-		stream);
-
+        stream);
+    cudaEventRecord(kernel_stop, stream  );
+    cudaEventSynchronize(kernel_stop);                     \
+    cudaEventElapsedTime(&cudaTime, start, kernel_stop);   \
+    fprintf(fp_probe, "Beta1: %f\n", cudaTime);
 #else
         A1_MC_STAR = A1;
 #endif
 
+#if 1
+	int B1_Height = B1.Height();
+	int B1_Width = B1.Width();
+	int B1_LocalHeight = B1.LocalHeight();
+	int B1_LocalWidth = B1.LocalWidth();
+	int B1_LDim= B1.LDim();
+
+        Copy (B1, B1_MCMR);
+	Matrix<T, D>& local_b1mcmr_mat = B1_MCMR.Matrix();
+        auto B1_MCMR_buffer = local_b1mcmr_mat.Buffer();
+
+	B1Trans_MR_STAR.Resize(B1_Width,B1_Height);
+	
+        Matrix<T, D>& local_mr_star_mat = B1Trans_MR_STAR.Matrix();
+        auto B1Trans_MR_STAR_buffer = local_mr_star_mat.Buffer();
+
+        MPI_Barrier(mpi_comm);
+	sync_counter++;
+        MPI_Barrier(mpi_comm);
+
+    cudaEventRecord(start, stream  );
+	mcmr_to_mrstar(fp_debug, 
+		mpi_comm,
+		run_timer,
+		kernel_start,
+		kernel_stop,
+		sync_counter,
+        	B1_Height, B1_Width,
+        	grid_height,
+        	grid_width,
+        B_my_pe_rank,
+        B_common_workspace,
+        B_dev_pes,
+	B_dev_sync_counter,
+        B_xnpes,
+        B_dev_send_buf,
+        B_dev_recv_buf,
+		B1_MCMR_buffer,
+		B1Trans_MR_STAR_buffer,
+        stream);
+    cudaEventRecord(kernel_stop, stream  );
+    cudaEventSynchronize(kernel_stop);                     \
+    cudaEventElapsedTime(&cudaTime, start, kernel_stop);   \
+    fprintf(fp_probe, "Beta2: %f\n", cudaTime);
+
+        MPI_Barrier(mpi_comm);
+#else
         Transpose(B1, B1Trans_MR_STAR);
+#endif
+
+
+#if 1
+    float cudaTime;
+    cudaEventRecord(kernel_start, stream  );
+
         LocalGemm
         (NORMAL, TRANSPOSE, alpha, A1_MC_STAR, B1Trans_MR_STAR, TypeTraits<T>::One(), C);
-    }
-}
+    cudaEventRecord(kernel_stop, stream  );
+    cudaEventSynchronize(kernel_stop);                     \
+    cudaEventElapsedTime(&cudaTime, kernel_start, kernel_stop);   \
+    *run_timer += cudaTime;
+    fprintf(fp_probe, "Beta3: %f\n", cudaTime);
+#endif
 
+    }
+fclose(fp_probe);
+    MPI_Barrier(mpi_comm);
+    NVSHMEM_mcmr_to_mcstar_cleanup(mpi_comm, common_workspace, dev_pes, dev_recv_buf, dev_send_buf);
+    NVSHMEM_mcmr_to_mrstar_cleanup(mpi_comm, B_common_workspace, B_dev_pes, B_dev_sync_counter, B_dev_recv_buf, B_dev_send_buf);
+    MPI_Barrier(mpi_comm);
+}
+}
 template <Device D, typename T,
           typename=DisableIf<IsDeviceValidType<T,D>>, typename=void>
 void SUMMA_NNC_impl(T alpha,
+               AbstractDistMatrix<T> const& APre,
+               AbstractDistMatrix<T> const& BPre,
+               AbstractDistMatrix<T>& CPre)
+{
+    LogicError("SUMMA_NNC_impl type-device combo not supported.");
+}
+template <Device D, typename T,
+          typename=DisableIf<IsDeviceValidType<T,D>>, typename=void>
+void SUMMA_NNC_impl(float *run_timer,
+	       cudaEvent_t kernel_start,
+	       cudaEvent_t kernel_stop,
+	       T alpha,
                AbstractDistMatrix<T> const& APre,
                AbstractDistMatrix<T> const& BPre,
                AbstractDistMatrix<T>& CPre)
@@ -560,8 +752,35 @@ void SUMMA_NNC
     default:
         LogicError("SUMMA_NNC: Bad device.");
     }
-
 }
+
+template<typename T>
+void SUMMA_NNC
+(float *run_timer,
+ cudaEvent_t kernel_start,
+ cudaEvent_t kernel_stop,
+  T alpha,
+  const AbstractDistMatrix<T>& APre,
+  const AbstractDistMatrix<T>& BPre,
+        AbstractDistMatrix<T>& CPre)
+{
+    EL_DEBUG_CSE
+
+    switch (CPre.GetLocalDevice())
+    {
+    case Device::CPU:
+        SUMMA_NNC_impl<Device::CPU>(alpha, APre, BPre, CPre);
+        break;
+#ifdef HYDROGEN_HAVE_CUDA
+    case Device::GPU:
+        SUMMA_NNC_impl<Device::GPU>(run_timer, kernel_start, kernel_stop, alpha, APre, BPre, CPre);
+        break;
+#endif // HYDROGEN_HAVE_CUDA
+    default:
+        LogicError("SUMMA_NNC: Bad device.");
+    }
+}
+
 
 // Normal Normal Gemm for panel-panel dot products
 //
@@ -706,6 +925,63 @@ void SUMMA_NN
     case GEMM_SUMMA_A:   SUMMA_NNA(alpha, A, B, C); break;
     case GEMM_SUMMA_B:   SUMMA_NNB(alpha, A, B, C); break;
     case GEMM_SUMMA_C:   SUMMA_NNC(alpha, A, B, C); break;
+    case GEMM_SUMMA_DOT: SUMMA_NNDot(alpha, A, B, C, blockSizeDot); break;
+    default: LogicError("Unsupported Gemm option");
+    }
+}
+
+template<typename T>
+void SUMMA_NN
+(float *run_timer,
+  cudaEvent_t kernel_start,
+  cudaEvent_t kernel_stop,
+  T alpha,
+  const AbstractDistMatrix<T>& A,
+  const AbstractDistMatrix<T>& B,
+        AbstractDistMatrix<T>& C,
+  GemmAlgorithm alg=GEMM_DEFAULT)
+{
+    EL_DEBUG_CSE
+    EL_DEBUG_ONLY(
+      AssertSameGrids(A, B, C);
+      if (A.Height() != C.Height() ||
+          B.Width() != C.Width() ||
+          A.Width() != B.Height())
+          LogicError
+          ("Nonconformal matrices:\n",
+           DimsString(A,"A"),"\n",
+           DimsString(B,"B"),"\n",
+           DimsString(C,"C"));
+   )
+
+    const Int m = C.Height();
+    const Int n = C.Width();
+    const Int sumDim = A.Width();
+    const double weightTowardsC = 2.;
+    const double weightAwayFromDot = 10.;
+
+    // TODO(poulson): Make this tunable
+    const Int blockSizeDot = 2000;
+
+    switch(alg)
+    {
+    case GEMM_DEFAULT:
+        if (weightAwayFromDot*m <= sumDim && weightAwayFromDot*n <= sumDim)
+        {
+            // FIXME (trb 03/27/18): There's a correctness issue with
+            // this method. This exception is for your own safety.
+            SUMMA_NNDot(alpha, A, B, C, blockSizeDot);
+        }
+        else if (m <= n && weightTowardsC*m <= sumDim)
+            SUMMA_NNB(alpha, A, B, C);
+        else if (n <= m && weightTowardsC*n <= sumDim)
+            SUMMA_NNA(alpha, A, B, C);
+        else
+            SUMMA_NNC(alpha, A, B, C);
+        break;
+    case GEMM_SUMMA_A:   SUMMA_NNA(alpha, A, B, C); break;
+    case GEMM_SUMMA_B:   SUMMA_NNB(alpha, A, B, C); break;
+    case GEMM_SUMMA_C:   SUMMA_NNC(run_timer, kernel_start, kernel_stop, alpha, A, B, C); break;
     case GEMM_SUMMA_DOT: SUMMA_NNDot(alpha, A, B, C, blockSizeDot); break;
     default: LogicError("Unsupported Gemm option");
     }

@@ -141,56 +141,11 @@ char OrientationToChar( Orientation orientation )
 }
 */
 
-/*
-std::vector<float> host_A(m*k,  0);
-cudaMemcpy(host_A.data(), A.LockedBuffer(), m*k*sizeof(float), cudaMemcpyDeviceToHost);
-printf("host_A\n");
-for( int j=0; j<(int)m*k; ++j ){
-	printf("%lf ", host_A[j]);
-}
-printf("\n");
-
-std::vector<float> host_B(k*n,  0);
-cudaMemcpy(host_B.data(), B.LockedBuffer(), m*k*sizeof(float), cudaMemcpyDeviceToHost);
-printf("host_B\n");
-for( int j=0; j<(int)m*n; ++j ){
-	printf("%lf ", host_B[j]);
-}
-printf("\n");
-
-   for( int i=0; i<(int)m; ++i )
-	printf("%f ", host_A[i+j*ldim]);
-const T* A_ptr=A.LockedBuffer();
-printf("A_ptr: m=%d n=%d ldim=%d\n", (int)m, (int)n, ldim);
-for( int j=0; j<(int)n; ++j ){
-   for( int i=0; i<(int)k; ++i )
-;//	printf("%f ", A_ptr[i+j*ldim]);
-   printf("\n");
-}
-*/
-//
-// printf("A_ptr: m=%d n=%d ldim=%d\n", (int)m, (int)n, lda);
-// for( int l=0; l<m*k; l++)
-//      printf("%f ", host_A[l]);
-//
-//
-
     gpu_cutlass_blas::Gemm_cutlass<T> (OrientationToChar(orientA), OrientationToChar(orientB), 
 	       (int)m, (int)n, (int)k,
                alpha, A.LockedBuffer(), A.LDim(),
                B.LockedBuffer(), B.LDim(),
                beta, C.Buffer(), C.LDim());
-
-/*
-std::vector<float> host_C(m*n,  0);
-cudaMemcpy(host_C.data(), C.LockedBuffer(), m*k*sizeof(float), cudaMemcpyDeviceToHost);
-printf("host_C\n");
-for( int j=0; j<(int)m*n; ++j ){
-	printf("%lf ", host_C[j]);
-}
-printf("\n");
-*/
-
 #else
     auto const transA = OrientationToTransposeMode(orientA);
     auto const transB = OrientationToTransposeMode(orientB);
@@ -284,6 +239,40 @@ void Gemm (
     const Int n = (orientB==NORMAL ? B.Width() : B.Height());
     C.Resize(m, n);
     Gemm(orientA, orientB, alpha, A, B, TypeTraits<T>::Zero(), C);
+}
+
+template<typename T>
+void Gemm
+(float *runtime,
+  cudaEvent_t kernel_start,
+  cudaEvent_t kernel_stop,
+  Orientation orientA, Orientation orientB,
+  T alpha, const AbstractDistMatrix<T>& A,
+           const AbstractDistMatrix<T>& B,
+  T beta,        AbstractDistMatrix<T>& C,
+  GemmAlgorithm alg)
+{
+    EL_DEBUG_CSE;
+    Scale(beta, C);
+    if(orientA == NORMAL && orientB == NORMAL)
+    {
+        if(alg == GEMM_CANNON)
+            gemm::Cannon_NN(alpha, A, B, C);
+        else
+            gemm::SUMMA_NN(runtime, kernel_start, kernel_stop, alpha, A, B, C, alg);
+    }
+    else if(orientA == NORMAL)
+    {
+        gemm::SUMMA_NT(orientB, alpha, A, B, C, alg);
+    }
+    else if(orientB == NORMAL)
+    {
+        gemm::SUMMA_TN(orientA, alpha, A, B, C, alg);
+    }
+    else
+    {
+        gemm::SUMMA_TT(orientA, orientB, alpha, A, B, C, alg);
+    }
 }
 
 template<typename T>
@@ -483,6 +472,14 @@ template void Gemm(Orientation orientA, Orientation orientB,
         Orientation, Orientation, T,                                    \
         AbstractMatrix<T> const&, AbstractMatrix<T> const&,             \
         T, AbstractMatrix<T>&);                                         \
+    template void Gemm(                                                 \
+	float* run_timer,						\
+	cudaEvent_t kernel_start,					\
+	cudaEvent_t kernel_stop,					\
+        Orientation orientA, Orientation orientB,                       \
+        T alpha, const AbstractDistMatrix<T>& A,                        \
+        const AbstractDistMatrix<T>& B,                                 \
+        T beta, AbstractDistMatrix<T>& C, GemmAlgorithm alg);           \
     template void Gemm(                                                 \
         Orientation orientA, Orientation orientB,                       \
         T alpha, const AbstractDistMatrix<T>& A,                        \

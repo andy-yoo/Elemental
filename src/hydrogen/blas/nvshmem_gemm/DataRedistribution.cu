@@ -4,16 +4,21 @@
 #include <hydrogen/device/gpu/CUDA.hpp>
 #include <cuda_runtime.h>
 
-//#include <El/core.hpp>
-
 #include <nvshmem.h>
 #include <nvshmemx.h>
 #include "mpi.h"
+
+#define MAX_PES	1025
 
 namespace El
 {
   template <typename T>
   class Complex;
+}
+
+__host__ __device__
+int pe_from_rank_coord(int r, int c, int d0, int d1){
+    return c*d0+r;
 }
 
 __host__ __device__
@@ -34,6 +39,36 @@ int local_height_mcmr(int p, int m, int n, int d0, int d1){
 __host__ __device__
 int local_width_mcmr(int p, int m, int n, int d0, int d1){
     return (n/d1 + ((grid_col_rank(p, d0, d1) < n%d1)?1:0));
+}
+
+__host__ __device__
+int local_height_starmr(int p, int m, int n, int d0, int d1){
+    return m;
+}
+
+__host__ __device__
+int local_width_starmr(int p, int m, int n, int d0, int d1){
+    return (n/d1 + ((grid_col_rank(p, d0, d1) < n%d1)?1:0));
+}
+
+__host__ __device__
+int local_height_mcstar(int p, int m, int n, int d0, int d1){
+    return (m/d0 + ((grid_row_rank(p, d0, d1) < m%d0)?1:0));
+}
+
+__host__ __device__
+int local_width_mcstar(int p, int m, int n, int d0, int d1){
+    return n;
+}
+
+__host__ __device__
+int local_height_mrstar(int p, int m, int n, int d0, int d1){
+    return (m/d1 + ((grid_col_rank(p, d0, d1) < m%d1)?1:0));
+}
+
+__host__ __device__
+int local_width_mrstar(int p, int m, int n, int d0, int d1){
+    return n;
 }
 
 __host__ __device__
@@ -150,7 +185,7 @@ int myidx = blockIdx.x;
         {
             if (watched_mem[inds[i]] != sync_counter)
             {
-//if(myidx == 0 ) printf("(%d) sync_counter=%d watched_mem[inds[%d]]=%d\n", me, sync_counter, i, watched_mem[inds[i]]);
+//if(myidx == 0 ) printf("(%d) sync_counter=%d inds[%d]=%d watched_mem[inds[%d]]=%d\n", me, sync_counter, i, inds[i], i, watched_mem[inds[i]]);
                 done = false;
                 break;
             }
@@ -193,13 +228,61 @@ void WaitOnSingle(int const volatile* watched_mem, int const value)
 }
 
 
+
+__device__
+void A__NotifyAll(int* workspace, int sync_counter,
+               int const* pes, int npes,
+               int my_rank)
+{
+    int const me = pes[my_rank]; // "global rank"
+    int* target = workspace + me;
+
+    // Flag myself as done
+    *target = sync_counter;
+
+    // Broadcast my value
+    for (int i = 1; i <= npes; ++i)
+    {
+        int const id = (my_rank + i) % npes;
+        int const& pe = pes[id];
+
+        // This should be nvshmem_int_p, but this doesn't work over
+        // IB. :/
+
+//printf("(%d) sending  %d to pes[%d] (me=%d) pe=%d\n", my_rank, sync_counter, id, me, pe);
+        nvshmem_int_put(target, target, 1, pe);
+    }
+    nvshmem_fence();
+}
+__device__
+void A__WaitOnAll(int me, int* workspace, int sync_counter,
+               int* inds, int npes)
+{
+    bool done = false;
+    while (!done)
+    {
+        done = true;
+        for (int i = 0; i < npes; ++i)
+        {
+            if (workspace[i] != sync_counter)
+            {
+                done = false;
+                break;
+            }
+	    else{
+//if(myidx == 0 ) printf("(%d) sync_counter=%d inds[%d]=%d workspace[inds[%d]]=%d\n", me, *sync_counter, i, inds[i], i, workspace[inds[i]]);
+	    }
+        }
+    }
+}
+
+
+
 __device__
 void _NotifyAll(int * const workspace, int const value,
                int const* pes, int const npes,
                int const my_rank)
 {
-
-
     int const me = pes[my_rank]; // "global rank"
     int *const target = workspace + me;
 
@@ -208,7 +291,31 @@ void _NotifyAll(int * const workspace, int const value,
 
     int val = (int) value;
     // Broadcast my value
-    for (int i = 1; i < npes; ++i)
+    for (int i = 1; i <= npes; ++i)
+    {
+        int const id = (my_rank + i) % npes;
+        int const& pe = pes[id];
+
+        // This should be nvshmem_int_p, but this doesn't work over
+        // IB. :/
+
+        nvshmem_int_put(target, target, 1, pe);
+    }
+}
+
+__device__
+void _NotifyRow(int * const workspace, int const value,
+		int grid_height, int grid_width,
+                int const* pes, int const npes,
+                int const my_rank)
+{
+    int const me = pes[my_rank]; // "global rank"
+    int *const target = workspace + me;
+
+    // Flag myself as done
+    *target = value;
+
+    for (int i = 1; i <= npes; ++i)
     {
         int const id = (my_rank + i) % npes;
         int const& pe = pes[id];
@@ -534,6 +641,641 @@ void unpack_mcmr_to_vc_star(int m, int n, int me, int grid_height, int grid_widt
     __syncthreads();
 }
 
+
+template <typename T>
+__global__
+void pack_mcmr_to_mrstar(int m, int n, int me, int grid_height, int grid_width, 
+T* dev_local_buffer, T* dev_send_buffer){
+    int myidx = threadIdx.x;
+    int stride = blockDim.x;
+    int total_block_size =  local_height_mcmr(me, m, n, grid_height, grid_width)* local_width_mcmr(me, m, n, grid_height, grid_width);
+
+    // Identify the column index that I am in
+    int my_col_rank = grid_col_rank(me, grid_height, grid_width);
+    int my_row_rank = grid_row_rank(me, grid_height, grid_width);
+    int j = myidx;
+
+    while(j < total_block_size){
+	int block_id = j/local_width_mcmr(me, m, n, grid_height, grid_width);
+	int block_offset = j%local_width_mcmr(me, m, n, grid_height, grid_width);
+	int t = block_offset*local_height_mcmr(me, m, n, grid_height, grid_width)+block_id;
+/*
+	int jj = j * local_height_mcmr(me, m, n, grid_height, grid_width);
+	int row_id = jj/local_width_mcmr(me, m, n, grid_height, grid_width);
+	int row_offset = jj%local_width_mcmr(me, m, n, grid_height, grid_width);
+	int jprime = row_offset + row_id;
+*/
+	dev_send_buffer[j] = dev_local_buffer[t];
+//if(me == 0) printf("j=%d jprime=%d\n", j, t);
+	j += stride;
+    }
+
+    __syncthreads();
+
+}
+
+
+template <typename T>
+__global__
+void gather_unpack_mcmr_to_mrstar (
+    int my_pe_rank, int m, int n, int grid_height, int grid_width,
+    T* dev_send_buf, T* dev_recv_buf, 
+    T* dev_target_buffer, int total_gather,
+    int send_size, int my_displs, int* const pes, int const npes, int* dev_sync_counter, int volatile* const workspace)
+{
+    int const myidx = threadIdx.x;
+
+
+    int const num_parts = grid_height;
+    int const threads_per_part = blockDim.x;
+    int part_id; // = 0; //myidx/threads_per_part;
+    int const my_col_rank =  grid_col_rank(my_pe_rank, grid_height, grid_width);
+    int const my_row_rank =  grid_row_rank(my_pe_rank, grid_height, grid_width);
+
+    int const stride = threads_per_part;
+    int const H = local_height_mrstar(my_pe_rank, n, m, grid_height, grid_width); 
+
+    if(grid_height*grid_width > MAX_PES)
+	printf("ERROR: Too many PEs to handle...\n");
+    __shared__ int displacements[MAX_PES];
+    
+    if(myidx == 0){
+       displacements[0] = 0;
+       for(int i=1; i<=grid_height; i++){
+    	   int pe =  my_col_rank*grid_height + (i-1);
+	   displacements[i]=displacements[i-1] + local_height_mcmr(pe, m, n, grid_height, grid_width)*local_width_mcmr(pe, m, n, grid_height, grid_width);
+        }
+    }
+    __syncthreads();
+
+
+    int offset;
+    int peer;
+    int part_begin;
+    int part_size;
+    int j;
+    int current_row_rank=my_row_rank;
+    int current_pe=my_pe_rank;
+    int prev_row_rank;
+    int prev_pe;
+    for (int i = 1;i<grid_height; i++)
+    {
+        int next_row_rank = (my_row_rank + i) % grid_height;
+        int next_pe = next_row_rank + my_col_rank*grid_height;
+        peer = pes[next_pe];
+
+        nvshmemx_float_put_nbi_block(dev_recv_buf+my_displs, dev_send_buf, send_size, peer);
+        nvshmem_fence();
+            
+        nvshmem_int_put((int*) workspace+my_row_rank, dev_sync_counter, 1, peer);
+
+//	nvshmem_quiet();
+
+        part_begin = displacements[current_row_rank];
+        part_size = displacements[current_row_rank+1] - displacements[current_row_rank];
+    	j = myidx;
+	part_id = current_row_rank;
+        while(j < part_size){
+	    int bid = j/H;
+	    int boffset = j%H;
+	    int jj = part_begin + j;
+	    int t = H*(part_id + bid*num_parts) + boffset;
+
+	    dev_target_buffer[t] = dev_recv_buf[jj];
+	    j += stride;
+        }
+        __syncthreads();
+
+#if 1
+	// Check for the next partition to merge: i.e., next_row, and update
+	prev_row_rank = (my_row_rank-i+grid_height) % grid_height;
+	if(myidx == 0){
+	   bool flag=true;
+	   while(flag){
+	      if(*(workspace+prev_row_rank) == *dev_sync_counter){
+		   flag = false;
+	      }
+	   }
+	}
+	__syncthreads();
+#else
+	prev_row_rank = (my_row_rank-i+grid_height) % grid_height;
+    	prev_pe = pe_from_rank_coord(prev_row_rank, my_col_rank, grid_height, grid_width);
+        //nvshmem_wait_until(workspace+prev_row_rank, NVSHMEM_CMP_EQ, *dev_sync_counter);
+#endif
+
+        current_row_rank = prev_row_rank;
+    	current_pe = pe_from_rank_coord(current_row_rank, my_col_rank, grid_height, grid_width);
+    }
+//	nvshmem_quiet();
+
+    part_begin = displacements[current_row_rank];
+    part_size = displacements[current_row_rank+1] - displacements[current_row_rank];
+    //part_size = local_height_mcmr(current_pe, m, n, grid_height, grid_width)*local_width_mcmr(current_pe, m, n, grid_height, grid_width);
+    j = myidx;
+    part_id = current_row_rank;
+    while(j < part_size){
+        int bid = j/H;
+	int boffset = j%H;
+	int jj = part_begin + j;
+	int t = H*(part_id + bid*num_parts) + boffset;
+//printf("jj=%d t=%d\n", jj, t);
+	dev_target_buffer[t] = dev_recv_buf[jj];
+	j += stride;
+     }
+     __syncthreads();
+}
+
+__global__
+void empty_kernel(){
+}
+
+
+template <typename T>
+__global__
+void allgather_unpack_mcmr_to_mrstar (
+    int my_pe_rank, int m, int n, int grid_height, int grid_width,
+    T* dev_send_buf, T* dev_recv_buf,
+    T* dev_target_buffer, int total_gather,
+    int send_size, int my_displs, int* const pes, int const npes, int* dev_sync_counter, int volatile* const workspace)
+{
+    int const myidx = threadIdx.x;
+
+    int const num_parts = grid_height;
+    int const threads_per_part = blockDim.x;
+    int part_id; // = 0; //myidx/threads_per_part;
+    int const my_col_rank =  grid_col_rank(my_pe_rank, grid_height, grid_width);
+    int const my_row_rank =  grid_row_rank(my_pe_rank, grid_height, grid_width);
+
+    int const stride = threads_per_part;
+    int const H = local_height_mrstar(my_pe_rank, n, m, grid_height, grid_width);
+
+
+    if(grid_height*grid_width > MAX_PES)
+        printf("ERROR: Too many PEs to handle...\n");
+    __shared__ int displacements[MAX_PES];
+
+    if(myidx == 0){
+       displacements[0] = 0;
+       for(int i=1; i<=grid_height; i++){
+           int pe =  my_col_rank*grid_height + (i-1);
+           displacements[i]=displacements[i-1] + local_height_mcmr(pe, m, n, grid_height, grid_width)*local_width_mcmr(pe, m, n, grid_height, grid_width);
+        }
+    }
+    __syncthreads();
+
+    int offset;
+    int peer;
+    int part_begin;
+    int part_size;
+    int j;
+    int current_row_rank=my_row_rank;
+    int current_pe=my_pe_rank;
+    int prev_row_rank;
+    int prev_pe;
+    for (int i = 1;i<grid_height; i++)
+    {
+        int next_row_rank = (my_row_rank + i) % grid_height;
+        int next_pe = next_row_rank + my_col_rank*grid_height;
+        peer = pes[next_pe];
+
+//printf("(%d) next_row=%d next_pe=%d peer=%d send_size=%d\n", my_pe_rank,  next_row, next_pe, peer, send_size);
+
+        nvshmemx_float_put_nbi_block(dev_recv_buf+my_displs, dev_send_buf, send_size, peer);
+    }
+    nvshmem_fence();
+
+    // Send notification to my column comrades
+    for (int i = 1;i<grid_height; i++)
+    {
+        int next_row_rank = (my_row_rank + i) % grid_height;
+        int next_pe = next_row_rank + my_col_rank*grid_height;
+        peer = pes[next_pe];
+
+        nvshmem_int_put((int*) workspace+my_row_rank, dev_sync_counter, 1, peer);
+    }
+
+    nvshmem_quiet();
+#if 1
+    // Local merge to target_buffer
+    part_begin = displacements[my_row_rank];
+    part_size = displacements[my_row_rank+1] - displacements[my_row_rank];
+    j = myidx;
+    part_id = my_row_rank;
+    while(j < part_size){
+        int bid = j/H;
+        int boffset = j%H;
+        int jj = part_begin + j;
+        int t = H*(part_id + bid*num_parts) + boffset;
+
+        dev_target_buffer[t] = dev_send_buf[jj];
+        j += stride;
+    }
+    __syncthreads();
+#else
+    // Local copy of send_buffer to recv_buffer
+    j = myidx;
+    while(j < part_size){
+        dev_recv_buffer[my_displs+j] = dev_send_buf[j];
+        j += stride;
+    }
+    __syncthreads();
+#endif
+
+    // check the arrival of notifications and merge those available
+    for (int i = 1;i<grid_height; i++)
+    {
+
+        current_row_rank = (my_row_rank+i) % grid_height;
+        if(myidx == 0){
+           bool flag=true;
+           while(flag){
+              if(*(workspace+current_row_rank) == *dev_sync_counter){
+                   flag = false;
+              }
+           }
+        }
+        __syncthreads();
+
+        part_begin = displacements[current_row_rank];
+        part_size = displacements[current_row_rank+1] - displacements[current_row_rank];
+
+        j = myidx;
+        part_id = current_row_rank;
+        while(j < part_size){
+            int bid = j/H;
+            int boffset = j%H;
+            int jj = part_begin + j;
+            int t = H*(part_id + bid*num_parts) + boffset;
+//printf("jj=%d t=%d\n", jj, t);
+            dev_target_buffer[t] = dev_recv_buf[jj];
+            j += stride;
+         }
+         __syncthreads();
+    }
+}
+
+// Here, m and n represent the size of source matrix .
+// But after unpacking the results will be in n by m matrix (i.e., transposed)
+// Make sure not to be confused by this orientation change
+template <typename T>
+__global__
+void unpack_mcmr_to_mrstar(int m, int n, int me, int grid_height, int grid_width, 
+T* dev_target_buffer, T* recv_buffer, int recv_buffer_size){
+    int const myidx = threadIdx.x;
+    int const num_parts = grid_height;
+    int const threads_per_part = blockDim.x/num_parts;
+    int const part_id = myidx/threads_per_part;
+    int const part_offset = myidx%threads_per_part;
+    int const my_col_rank  =  grid_col_rank(me, grid_height, grid_width);
+
+    int acc=0;
+    int my_part_begin;
+    int part_size;
+    for(int r=0; r<grid_height; r++){
+	int pe =  my_col_rank*grid_height + r;
+
+        part_size = local_height_mcmr(pe, m, n, grid_height, grid_width)* local_width_mcmr(pe, m, n, grid_height, grid_width);
+	if(r == part_id){
+	   my_part_begin = acc;
+	   break;
+	}
+	acc += part_size;
+    }
+
+    int const stride = threads_per_part;
+    int const H = local_height_mrstar(me, n, m, grid_height, grid_width); 
+
+    int j = part_offset;
+    while(j < part_size){
+	int bid = j/H;
+	int boffset = j%H;
+	int jj = my_part_begin + j;
+	int t = H*(part_id + bid*num_parts) + boffset;
+
+	dev_target_buffer[t] = recv_buffer[jj];
+	j += stride;
+    }
+    __syncthreads();
+
+}
+
+template <typename T>
+__global__
+void unpack_mcmr_to_mcstar(int m, int n, int me, int grid_height, int grid_width, T* dev_target_buffer, T* recv_buffer, int recv_buffer_size){
+    int const myidx = threadIdx.x;
+    int const num_parts = grid_width;
+    int const threads_per_part = blockDim.x/num_parts;
+    int const part_id = myidx/threads_per_part;
+    int const part_offset = myidx%threads_per_part;
+    int const my_row_rank  =  grid_row_rank(me, grid_height, grid_width);
+
+    int part_size;
+    int my_part_begin;
+    int acc = 0;
+    for(int c=0; c<grid_width; c++){
+	int pe = c*grid_height + my_row_rank;
+	part_size = local_height_mcmr(pe, m, n, grid_height, grid_width)*local_width_mcmr(pe, m, n, grid_height, grid_width);
+	if(c == part_id){
+	   my_part_begin = acc;
+	   break;
+	}
+	acc += part_size;
+    }
+
+    int const stride = threads_per_part;
+    int const H = local_height_mcstar(me, m, n, grid_height, grid_width);
+ 
+    int j = part_offset;
+    while(j < part_size){
+	int bid = j/H;
+	int boffset = j%H;
+	int jj = my_part_begin + j;
+	int t = H*(part_id+bid*num_parts) + boffset;
+	
+	dev_target_buffer[t] = recv_buffer[jj];
+
+	j += stride;
+    }
+
+/*
+    // Identify the column index that I am in
+    int row = grid_row_rank(me, grid_height, grid_width);
+    int j = myidx;
+
+    // Find the column index for initial location j
+    int col_index = 0;
+    int running_acc = 0;
+    int i, from_pe;
+    int block_id;
+    int offset;
+
+    int const stride = 1;
+    while(j < recv_buffer_size){
+    	for(i=col_index; i<grid_width; i++){
+	    from_pe = i*grid_height + row;
+	    int p_block = local_height_mcmr(from_pe, m, n, grid_height, grid_width)* local_width_mcmr(from_pe, m, n, grid_height, grid_width);
+ 	    if(j < running_acc+p_block){
+	       col_index = i;
+	       break;
+	    }
+	    running_acc += p_block;
+        }
+        if(i == grid_width){
+           printf("In unpacking from [MC,MR] to [MC,*]: size mismatch\n");
+        }
+
+	// At this point, j is in column id col_index (and pe p)
+	// Find the id of block in received buffer from pe 'p'
+	block_id = (j-running_acc) / local_height_mcmr(me, m, n, grid_height, grid_width);
+	offset = (j-running_acc) % local_height_mcmr(me, m, n, grid_height, grid_width);
+
+	// Now compute target index t;
+	int t = (col_index + grid_width*block_id)*local_height_mcmr(me, m, n, grid_height, grid_width) + offset;
+
+//if(me ==0) printf("(%d) j=%d block_id=%d offset=%d t=%d\n", myidx, j, block_id, offset, t);
+	dev_target_buffer[t] = recv_buffer[j];
+        j += stride;
+    }
+*/
+    __syncthreads();
+}
+
+template <typename T>
+__global__
+void Allgatherv_put_col_kernel(
+    int const my_pe_rank, int m, int n, int const grid_height, int const grid_width,
+    T* __restrict__ sbuf, T* __restrict__ rbuf,
+    int const my_displs, int send_size,
+    int const* pes, int const npes, int const sync_counter, int volatile* workspace)
+{
+#if 1
+    int myidx = threadIdx.x;
+
+    // There will only ever be a single block with this kernel. 
+    // This greatly simplifies things.
+
+    // Does column-wise allgatherv
+    // my_data_loc points the location where local copes start
+
+    int my_col_rank = my_pe_rank/grid_height;
+    int my_row_rank = my_pe_rank%grid_height;
+
+    for (int i = 1; i <=grid_height; ++i)
+    {
+        auto const offset = (my_row_rank + i) % grid_height;
+        auto const target_pe = offset + my_col_rank*grid_height;
+        auto const peer = pes[target_pe];
+
+//printf("(%d) offset=%d target_pe=%d peer=%d send_size=%d\n", my_pe_rank,  offset, target_pe, peer, send_size);
+
+        nvshmemx_float_put_nbi_block(rbuf+my_displs, sbuf, send_size, peer);
+    }
+#else
+    int myidx = threadIdx.x;
+    int stride = blockDim.x;
+    int block_size = local_height_mcmr(my_pe_rank, m, n, grid_height, grid_width);
+
+    int my_col_rank = my_pe_rank/grid_height;
+    int my_row_rank = my_pe_rank%grid_height;
+
+    int j;
+    for (int i = 1; i <=grid_height; ++i)
+    {
+        auto const offset = (my_row_rank + i) % grid_height;
+        auto const target_pe = offset + my_col_rank*grid_height;
+        auto const peer = pes[target_pe];
+
+//printf("(%d) offset=%d target_pe=%d peer=%d send_size=%d\n", my_pe_rank,  offset, target_pe, peer, send_size);
+
+	int ii, jj, t;
+	int disp;
+    	j = myidx;
+	while(j < send_size){
+
+	  disp = j % block_size;
+	  jj = j / block_size;
+ 	  ii = disp*grid_height + my_row_rank; 
+ 	  t = ii*n + jj;
+          nvshmem_float_put(rbuf+t, sbuf+j, 1, peer);
+	  j += stride;
+ 	}
+    }
+#endif
+
+#if 0
+    // Order them before the sync puts
+    if (threadIdx.x == 0)
+        nvshmem_quiet();
+    __syncthreads();
+
+//printf("(%d) After fence \n", my_pe_rank);
+
+
+    // Now that all the data has been put, we can flag to the receiver
+    // PEs that the transfer is done. These are blocked after the
+    // fence so there's only one fence.
+
+#if 1
+    if (threadIdx.x == 0){
+        int const me = pes[my_pe_rank]; // "global rank"
+        int *const target = workspace + me;
+
+        // Flag myself as done
+        *target = sync_counter;
+
+        for (int i = 1; i <= npes; ++i)
+        {
+            int const id = (my_pe_rank + i) % npes;
+            int const pe = pes[id];
+
+            // This should be nvshmem_int_p, but this doesn't work over
+            // IB. :/
+
+//if(myidx == 0) printf("(%d) sending  %d to pes[%d] (me=%d) pe=%d\n", my_pe_rank, sync_counter, id, me, pe);
+            nvshmem_int_put(target, target, 1, pe);
+
+            //nvshmem_int_put(workspace + me, sync_counter, 1, pe);
+            //nvshmemx_int_put_nbi_block(target, target, 1, pe);
+
+        }
+    }
+ //   if (threadIdx.x == 0){
+ //       nvshmem_quiet();
+ //   }
+    nvshmem_quiet();
+    __syncthreads();
+
+    if (threadIdx.x == 0){
+      bool done = false;
+      while (!done)
+      {
+        done = true;
+        for (int i = 0; i < npes; ++i)
+        {
+            //if (watched_mem[inds[i]] != *sync_counter)
+            if (workspace[i] != sync_counter)
+            {
+if(myidx == 0) printf("waiting on (%d) npes=%d sync_counter=%d workspace[%d]=%d\n", my_pe_rank, npes, sync_counter, i, workspace[i]);
+                done = false;
+                break;
+            }
+            else{
+//if(my_pe_rank == 0)
+//printf("[%d] sync_counter=%d workspace[%d]=%d\n", my_pe_rank, *sync_counter, i, workspace[i]);
+            }
+        }
+      }
+    }
+    __syncthreads();
+#endif
+#endif
+
+}
+
+template <typename T>
+__global__
+void Allgatherv_put_row_kernel(
+    int const my_pe_rank, int const grid_height, int const grid_width,
+    T* __restrict__ sbuf, T* __restrict__ rbuf,
+    int const my_displs, int send_size,
+    int const* pes, int const npes, int const sync_counter, int volatile* workspace)
+{
+
+    // There will only ever be a single block with this kernel. 
+    // This greatly simplifies things.
+
+    // Does row-wise allgatherv
+
+    // my_data_loc points the location where local copes start
+
+    int my_col_rank = my_pe_rank/grid_height;
+    int my_row_rank = my_pe_rank%grid_height;
+
+    for (int i = 1; i <=grid_width; ++i)
+    {
+        auto const offset = (my_col_rank + i) % grid_width;
+        auto const target_pe = offset*grid_height + my_row_rank;
+        //auto const target_pe = my_col_rank*grid_height + offset;
+        auto const peer = pes[target_pe];
+
+//printf("(%d) offset=%d target_pe=%d peer=%d send_size=%d\n", my_pe_rank,  offset, target_pe, peer, send_size);
+
+        nvshmemx_float_put_nbi_block(rbuf+my_displs, sbuf, send_size, peer);
+    }
+
+#if 0
+    // Order them before the sync puts
+    if (threadIdx.x == 0)
+        nvshmem_quiet();
+    __syncthreads();
+
+//printf("(%d) After fence \n", my_pe_rank);
+
+
+    // Now that all the data has been put, we can flag to the receiver
+    // PEs that the transfer is done. These are blocked after the
+    // fence so there's only one fence.
+    //if (threadIdx.x == 0)
+//    A__NotifyAll(workspace, sync_counter, pes, npes, my_pe_rank);
+
+#if 1
+    if (threadIdx.x == 0){
+        int const me = pes[my_pe_rank]; // "global rank"
+        int *const target = workspace + me;
+
+        // Flag myself as done
+        *target = sync_counter;
+
+        for (int i = 1; i <= npes; ++i)
+        {
+            int const id = (my_pe_rank + i) % npes;
+            int const pe = pes[id];
+
+            // This should be nvshmem_int_p, but this doesn't work over
+            // IB. :/
+
+//if(myidx == 0) printf("(%d) sending  %d to pes[%d] (me=%d) pe=%d\n", my_pe_rank, sync_counter, id, me, pe);
+            nvshmem_int_put(target, target, 1, pe);
+
+            //nvshmem_int_put(workspace + me, sync_counter, 1, pe);
+            //nvshmemx_int_put_nbi_block(target, target, 1, pe);
+
+        }
+    }
+ //   if (threadIdx.x == 0){
+ //       nvshmem_quiet();
+ //   }
+    nvshmem_quiet();
+    __syncthreads();
+
+    if (threadIdx.x == 0){
+    bool done = false;
+    while (!done)
+    {
+        done = true;
+        for (int i = 0; i < npes; ++i)
+        {
+            //if (watched_mem[inds[i]] != *sync_counter)
+            if (workspace[i] != sync_counter)
+            {
+//if(myidx == 0) printf("waiting on (%d) npes=%d sync_counter=%d workspace[%d]=%d\n", my_pe_rank, npes, sync_counter, i, workspace[i]);
+                done = false;
+                break;
+            }
+            else{
+//if(my_pe_rank == 0)
+//printf("[%d] sync_counter=%d workspace[%d]=%d\n", my_pe_rank, *sync_counter, i, workspace[i]);
+            }
+        }
+    }
+    }
+    __syncthreads();
+#endif
+#endif
+
+}
+
 // Here 'my_pe_rank' is my pe rank, not MPI rank, and needs to be mapped to actual
 // PE via pes before communication.
 template <typename T>
@@ -542,9 +1284,9 @@ void Allgatherv_put_kernel(
     int const my_pe_rank, int const grid_height, int const grid_width,
     T* __restrict__ sbuf, T* __restrict__ rbuf,
     int const displacement, int const size,
-    int const* pes, int const npes, int const sync_counter, int* const workspace)
+    int const* pes, int const npes, int const sync_counter, int* workspace)
 {
-    NotifyAll(workspace, sync_counter, pes, npes, my_pe_rank);
+    NotifyAll((int*) workspace, sync_counter, pes, npes, my_pe_rank);
     // There will only ever be a single block with this kernel. 
     // This greatly simplifies things.
 
@@ -705,14 +1447,67 @@ void  finalize_gemm_kernel(int const my_row_rank, int const my_col_rank, int con
 
 __global__
 void Global_sync_kernel(
-    int const* pes, int const npes, int const my_pe_rank, 
-    int const  sync_counter, int* workspace)
+    int* pes, int npes, int my_pe_rank, 
+    int sync_counter, int* workspace)
 {
-    _NotifyAll(workspace, sync_counter, pes, npes, my_pe_rank);
-    __syncthreads();
+#if 1
+//printf("(%d) npes=%d \n", my_pe_rank, npes); 
+    int const me = pes[my_pe_rank]; // "global rank"
+    int *const target = workspace + me;
+
+    // Flag myself as done
+    *target = sync_counter;
+
+    for (int i = 1; i <= npes; ++i)
+    {
+        int const id = (my_pe_rank + i) % npes;
+        int const pe = pes[id];
+
+        // This should be nvshmem_int_p, but this doesn't work over
+        // IB. :/
+
+//printf("(%d) sending  %d to pes[%d] (me=%d) pe=%d\n", my_pe_rank, sync_counter, id, me, pe);
+        nvshmem_int_put(target, target, 1, pe);
+
+        //nvshmem_int_put(workspace + me, sync_counter, 1, pe);
+    	//nvshmemx_int_put_nbi_block(target, target, 1, pe);
+
+    }
     nvshmem_fence();
-    _WaitOnAll(my_pe_rank, workspace, sync_counter, pes, npes);
+
+#if 1
+    bool done = false;
+    while (!done)
+    {
+        done = true;
+        for (int i = 0; i < npes; ++i)
+        {
+            //if (watched_mem[inds[i]] != *sync_counter)
+            if (workspace[i] != sync_counter)
+            {
+//if(my_pe_rank == 0)
+//printf("-(%d) npes=%d sync_counter=%d workspace[%d]=%d\n", my_pe_rank, npes, sync_counter, i, workspace[i]);
+                done = false;
+//                break;
+            }
+            else{
+//if(my_pe_rank == 0)
+//printf("[%d] sync_counter=%d workspace[%d]=%d\n", my_pe_rank, sync_counter, i, workspace[i]);
+            }
+        }
+    }
+#endif
+#else
+    A__NotifyAll(workspace, sync_counter, pes, npes, my_pe_rank);
+    A__WaitOnAll(my_pe_rank, workspace, sync_counter, pes, npes);
+#endif
+
+/*
     __syncthreads();
+    __syncthreads();
+*/
+
+ return;
 }
 
 
@@ -933,11 +1728,32 @@ void Alltoall_put_kernel_boring(
 namespace hydrogen
 {
 
-void Global_sync (int me, int const* pes, int const npes, int const sync_counter, int* sync_space, cudaStream_t const stream)
+void counts_mcmr_to_mrstar(int grid_height, int grid_width, int myrank, int m, int n, int* total_gather, int* my_displs)
 {
-    int const num_threads = 1024;
-    Global_sync_kernel<<<1,num_threads,0,stream>>>(
-	pes, npes, me, sync_counter, sync_space);
+    *total_gather = 0;
+    int grid_size = grid_height*grid_width;
+    for(int j=0; j<grid_size; j++){
+        if(j == myrank)
+           *my_displs = *total_gather;
+        if(grid_col_rank(myrank, grid_height, grid_width) == grid_col_rank(j, grid_height, grid_width)){
+           *total_gather += local_height_mcmr(j, m, n, grid_height, grid_width) * local_width_mcmr(j, m, n, grid_height, grid_width);
+        }
+    }
+}
+
+void counts_mcmr_to_mcstar(
+	int grid_height, int grid_width, int myrank, int m, int n, int* total_gather, int* my_displs)
+{
+    *total_gather = 0;
+    int grid_size = grid_height*grid_width;
+    int pos=0;
+    for(int j=0; j<grid_size; j++){
+        if(j == myrank)
+	   *my_displs = *total_gather;
+	if(grid_row_rank(myrank, grid_height, grid_width) == grid_row_rank(j, grid_height, grid_width)){
+           *total_gather += local_height_mcmr(j, m, n, grid_height, grid_width) * local_width_mcmr(j, m, n, grid_height, grid_width);
+	}
+    }
 }
 
 void counts_mcmr_to_vc_star(int grid_height, int grid_width, int myrank, int m, int n,
@@ -970,7 +1786,6 @@ void counts_mcmr_to_vc_star(int grid_height, int grid_width, int myrank, int m, 
         *total_recv += recv_counts[p-1];
     }
 
-    // me is me
     int my_row_rank = grid_row_rank(myrank, grid_height, grid_width);
     int index=0;
     for(int target_pe=0; target_pe<grid_size; target_pe++){
@@ -1030,22 +1845,34 @@ void convert_mcmr_to_vcstar(int m, int n, int me, int grid_height, int grid_widt
 
     std::vector<T> send_buffer(total_send);
     std::vector<T> recv_buffer(total_recv);
-    //num_threads = min(total_send, 1024);
-    num_threads = 1024;
+    num_threads = min(total_send, 1024);
     
     int* dev_send_displs = (int*) nvshmem_malloc(send_displs.size()*sizeof(int));
+    if(dev_send_displs == NULL){
+       throw std::runtime_error("error allocating SDO");
+    }
+    if(dev_send_displs == NULL){
+       throw std::runtime_error("In from [MC,MR] to [VC,*]: error allocating SDO");
+    }
     CHECK_CUDA(cudaMemcpy((void*) dev_send_displs, (void const*) send_displs.data(), send_displs.size()*sizeof(int), cudaMemcpyHostToDevice));
-    //CHECK_CUDA(cudaMemcpyAsync((void*) dev_send_displs, (void const*) send_displs.data(), send_displs.size()*sizeof(int), cudaMemcpyHostToDevice, stream));
 
     T* dev_send_buf = (T*) nvshmem_malloc(max_send*sizeof(T));
+    if(dev_send_buf == NULL){
+       throw std::runtime_error("In from [MC,MR] to [VC,*]: error allocating SDO");
+    }
     CHECK_CUDA(cudaMemcpy((void*) dev_send_buf, (void const*) send_buffer.data(), total_send*sizeof(T), cudaMemcpyHostToDevice));
     //CHECK_CUDA(cudaMemcpyAsync((void*) dev_send_buf, (void const*) send_buffer.data(), total_send*sizeof(T), cudaMemcpyHostToDevice, stream));
 
     int* dev_target_offset_counts = (int*) nvshmem_malloc(offset_counts.size()*sizeof(int));
-    //CHECK_CUDA(cudaMemcpyAsync((void*) dev_target_offset_counts, (void const*) offset_counts.data(), offset_counts.size()*sizeof(int), cudaMemcpyHostToDevice, stream));
+    if(dev_target_offset_counts == NULL){
+       throw std::runtime_error("In from [MC,MR] to [VC,*]: error allocating SDO");
+    }
     CHECK_CUDA(cudaMemcpy((void*) dev_target_offset_counts, (void const*) offset_counts.data(), offset_counts.size()*sizeof(int), cudaMemcpyHostToDevice));
 
     T* dev_recv_buf = (T*) nvshmem_malloc(max_recv*sizeof(T));
+    if(dev_recv_buf == NULL){
+       throw std::runtime_error("In from [MC,MR] to [VC,*]: error allocating SDO");
+    }
 
     pack_mcmr_to_vc_star<<<1,num_threads,0,stream>>> (m, n, me, grid_height, grid_width, dev_send_displs, local_buffer, dev_send_buf);
 
@@ -1158,8 +1985,7 @@ int me,
                 1, num_threads, args, 0, stream);
 #endif
 
-    Alltoallv_put_kernel<<<1,num_threads,0,stream>>>(
-total_recv,
+    Alltoallv_put_kernel<<<1,num_threads,0,stream>>>( total_recv,
         sbuf, rbuf, sdispls, target_offset_counts,
 	pes, npes, me, sync_counter, sync_space);
 
@@ -1199,10 +2025,9 @@ void convert_vcstar_to_vrstar(int m, int n, int my_pe_rank,
     int max_recv_size_vcstar_to_vrstar = (int) ceil(((double)m)/grid_height) * local_width_vcstar(from_pe, m, n, grid_height, grid_width);
     int local_recv_size_vcstar_to_vrstar = local_height_vcstar(from_pe, m, n, grid_height, grid_width) * local_width_vcstar(from_pe, m, n, grid_height, grid_width);
     T* dev_recv_buffer = (T*) nvshmem_malloc(max_recv_size_vcstar_to_vrstar*sizeof(T));
-/*
-    T* dev_local_buffer = (T*) nvshmem_malloc(max_recv_size_vcstar_to_vrstar*sizeof(T));
-    CHECK_CUDA(cudaMemcpy((void*) dev_local_buffer, (void const*) local_buffer, local_size*sizeof(T), cudaMemcpyDeviceToDevice));
-*/
+    if(dev_recv_buffer == NULL){
+       throw std::runtime_error("In from [VC,*] to [VR,*]: error allocating SDO");
+    }
 
     //Sendrecv_put(dev_local_buffer, local_size, to_pe,
     Sendrecv_put(local_buffer, local_size, to_pe,
@@ -1298,6 +2123,47 @@ void counts_starvr_to_starmr(int const my_pe_rank, int const m, int const n, int
         star_mr_buffer_displs[i] = star_mr_buffer_displs[i-1]+mr_msg_cnts[i-1];
 }
 
+
+template <typename T>
+void Allgatherv_put_col(int const my_pe_rank, int m, int n, 
+	int const grid_height, int const grid_width,
+        T* dev_send_buf, T* dev_recv_buf, int send_size,
+        int const my_displ,
+        int const* pes, int const npes,
+	int sync_counter,
+        int* const sync_space, cudaStream_t const stream)
+{
+    // No sense using more threads than data elements, I should think...
+    //int const num_threads = std::min(send_size, 1024);
+    int const num_threads = min(send_size, 1024);
+    Allgatherv_put_col_kernel<<<1,num_threads,0,stream>>>(
+        my_pe_rank, m, n, grid_height, grid_width,
+        dev_send_buf, dev_recv_buf, 
+        my_displ, send_size,
+        pes, npes, sync_counter, sync_space);
+
+    nvshmemx_quiet_on_stream(stream);
+}
+
+template <typename T>
+void Allgatherv_put_row(int const my_pe_rank, int const grid_height, int const grid_width,
+        T* dev_send_buf, T* dev_recv_buf, int send_size,
+        int const my_displ,
+        int const* pes, int const npes,
+	int sync_counter,
+        int* const sync_space, cudaStream_t const stream)
+{
+    // No sense using more threads than data elements, I should think...
+    //int const num_threads = std::min(send_size, 1024);
+    int const num_threads = min(send_size, 1024);
+    Allgatherv_put_row_kernel<<<1,num_threads,0,stream>>>(
+        my_pe_rank, grid_height, grid_width,
+        dev_send_buf, dev_recv_buf, 
+        my_displ, send_size,
+        pes, npes, sync_counter, sync_space);
+    nvshmemx_quiet_on_stream(stream);
+}
+
 // Convert a Matrix (of size m x n) in [*,VR] format to the one in [*,MR] format.
 // 'my_pe_rank' is my PE number in given communicator, which MUSTT be mapped to actual
 // PE number for communication
@@ -1336,6 +2202,9 @@ void convert_starvr_to_starmr(int m, int n, int my_pe_rank,
     counts_starvr_to_starmr(my_pe_rank, m, n, grid_height, grid_width, mr_msg_cnts, star_mr_buffer_displs, &sum);
 
     T* dev_recv_buf = (T*) nvshmem_malloc(sum*sizeof(T));
+    if(dev_recv_buf == NULL){
+       throw std::runtime_error("error allocating SDO");
+    }
     T* dev_star_mr_buffer_displs;
     CHECK_CUDA(cudaMalloc((void**) &dev_star_mr_buffer_displs, (size_t) ((grid_height+1)*sizeof(T))));
 
@@ -1377,10 +2246,16 @@ void axpy(int m, int n, int my_pe_rank,
     // dev_reduction_buf will hold the intermediate reduction data received from my partener during reduction process and
     int local_reduction_buffer_length = n*local_height_mcmr(my_pe_rank, m, n, grid_height, grid_width);
     T* dev_reduction_buf = (T*) nvshmem_malloc(local_reduction_buffer_length*sizeof(T));
+    if(dev_reduction_buf == NULL){
+       throw std::runtime_error("error allocating SDO");
+    }
 
     // dev_final_buf will hold the final GEMM results after reduce-scatter
     int final_buf_length = local_height_mcmr(my_pe_rank, m, n, grid_height, grid_width)*local_width_mcmr(my_pe_rank, m, n, grid_height, grid_width);
     T* dev_final_buf = (T*) nvshmem_malloc(final_buf_length*sizeof(T));
+    if(dev_final_buf == NULL){
+       throw std::runtime_error("error allocating SDO");
+    }
 
     int row_width = grid_width;
     int my_row_rank = grid_row_rank(my_pe_rank, grid_height, grid_width);
@@ -1478,17 +2353,17 @@ dev_location_find_displs, dev_scatter_counter, dev_scatter_displs, chunk_unit, d
 }
 
 template<typename T>
-void mcmr_to_vrstar(MPI_Comm, int, int, int, int, T*, T*, cudaStream_t)
+void mcmr_to_vcstar(MPI_Comm, int, int, int, int, T*, T*, cudaStream_t)
 {
   throw std::runtime_error("Function not implemented\n");
 }
 
-void mcmr_to_vrstar(MPI_Comm mpi_comm,
+void mcmr_to_vcstar(MPI_Comm mpi_comm,
 	int m,
 	int n,
 	int grid_height,
 	int grid_width,
-	float* dev_B_buffer,
+	float* dev_Matrix_buffer,
 	float* dev_target_buffer,
 	cudaStream_t stream)
 {
@@ -1526,48 +2401,603 @@ void mcmr_to_vrstar(MPI_Comm mpi_comm,
     	num_threads = min(total_send, 1024);
 
     	int* dev_send_displs = (int*) nvshmem_malloc(send_displs.size()*sizeof(int));
+        if(dev_send_displs == NULL){
+           throw std::runtime_error("error allocating SDO");
+        }
     	CHECK_CUDA(cudaMemcpy((void*) dev_send_displs, (void const*) send_displs.data(), send_displs.size()*sizeof(int), cudaMemcpyHostToDevice));
 
     	float* dev_send_buf = (float*) nvshmem_malloc(max_send*sizeof(float));
+        if(dev_send_buf == NULL){
+           throw std::runtime_error("error allocating SDO");
+        }
     	int* dev_target_offset_counts = (int*) nvshmem_malloc(offset_counts.size()*sizeof(int));
+        if(dev_target_offset_counts == NULL){
+           throw std::runtime_error("error allocating SDO");
+        }
     	CHECK_CUDA(cudaMemcpy((void*) dev_target_offset_counts, (void const*) offset_counts.data(), offset_counts.size()*sizeof(int), cudaMemcpyHostToDevice));
 
     	float* dev_recv_buf = (float*) nvshmem_malloc(max_recv*sizeof(float));
+        if(dev_recv_buf == NULL){
+           throw std::runtime_error("error allocating SDO");
+        }
 
     	int to_pe = vcstar_to_vrstar_to_pid(my_pe_rank, grid_height, grid_width);
     	int from_pe = vcstar_to_vrstar_from_pid(my_pe_rank, grid_height, grid_width);
     	int local_recv_size_vcstar_to_vrstar = local_height_vcstar(from_pe, m, n, grid_height, grid_width) * local_width_vcstar(from_pe, m, n, grid_height, grid_width);
 
-        //int dev_local_buffer_size = max(total_recv, mcmr_local_height*mcmr_local_width);
         int dev_local_buffer_size = max(max_recv, mcmr_local_height*mcmr_local_width);
         dev_local_buffer_size = max(dev_local_buffer_size, max_send);
-        dev_local_buffer_size = max(dev_local_buffer_size, local_height_vrstar(my_pe_rank, m, n, grid_height, grid_width)*local_width_vrstar(my_pe_rank, m, n, grid_height, grid_width));
-        dev_local_buffer_size = max(dev_local_buffer_size, local_recv_size_vcstar_to_vrstar);
         float* dev_local_buffer = (float*) nvshmem_malloc(dev_local_buffer_size*sizeof(float));
-        CHECK_CUDA(cudaMemcpy((void*) dev_local_buffer, (void const*) dev_B_buffer, 
+        if(dev_local_buffer == NULL){
+           throw std::runtime_error("error allocating SDO");
+        }
+        CHECK_CUDA(cudaMemcpy((void*) dev_local_buffer, (void const*) dev_Matrix_buffer, 
                 mcmr_local_height*mcmr_local_width*sizeof(float), cudaMemcpyDeviceToDevice));
 
     	pack_mcmr_to_vc_star<<<1,num_threads,0, stream>>> (m, n, my_pe_rank, grid_height, grid_width, dev_send_displs, dev_local_buffer, dev_send_buf);
 
-//printf("(%d) after pack_mcmr_to_vc_star \n", my_pe_rank);
         int workspace_size = grid_size;
-        int* common_workspace = (int*) nvshmem_malloc(workspace_size *sizeof(int));
+        int* common_workspace = (int*) nvshmem_malloc(workspace_size*sizeof(int));
+        if(common_workspace == NULL){
+           throw std::runtime_error("error allocating SDO");
+        }
         CHECK_CUDA(cudaMemset(common_workspace, 0, workspace_size*sizeof(int)));
 
         int* dev_pes = (int*) nvshmem_malloc(xnpes*sizeof(int));
+        if(dev_pes == NULL){
+           throw std::runtime_error("error allocating SDO");
+        }
         CHECK_CUDA(cudaMemcpy((void*) dev_pes, (void const*) pes.data(), xnpes*sizeof(int), cudaMemcpyHostToDevice));
 
     	int sync_counter=1;
     	Alltoallv_put(total_recv, my_pe_rank, dev_send_buf, dev_recv_buf, dev_send_displs, dev_target_offset_counts, dev_pes, xnpes, sync_counter, common_workspace, stream);
 
-//printf("(%d) after Alltoallv_put  \n", my_pe_rank);
     	int* dev_recv_displs = (int*) nvshmem_malloc(grid_size+1);
+        if(dev_recv_displs == NULL){
+           throw std::runtime_error("error allocating SDO");
+        }
 
     	CHECK_CUDA(cudaMemcpy((void*) dev_recv_displs, (void const*) recv_displs.data(), (grid_size+1)*sizeof(int), cudaMemcpyHostToDevice));
 
     	num_threads = min(max_recv, 1024);
     	unpack_mcmr_to_vc_star<<<1,num_threads,0,stream>>> (m, n, my_pe_rank, grid_height, grid_width, dev_recv_displs, dev_local_buffer, dev_recv_buf);
 
+#if 0
+//printf("(%d) after unpack_mcmr_to_vc_star \n", my_pe_rank);
+char line[132];
+FILE* fp_debug;
+sprintf(line, "___vcstar.%04d", my_pe_rank);
+fp_debug = fopen(line, "w");
+
+std::vector<float> VC_STAR_mem_buffer(max_recv);
+cudaMemcpy(VC_STAR_mem_buffer.data(), dev_local_buffer, max_recv*sizeof(float), cudaMemcpyDeviceToHost);
+fprintf(fp_debug, "Buffer of B_VC_STAR...\n");
+for(int l=0; l<total_recv; l++){
+       fprintf(fp_debug, "%f ", VC_STAR_mem_buffer[l]);
+}
+fprintf(fp_debug, "\n");
+fclose(fp_debug);
+#endif
+
+/*
+sprintf(line, "memsizes.%04d", my_pe_rank);
+fp_debug = fopen(line, "w");
+
+fprintf(fp_debug, "dev_send_displs: %d\n", send_displs.size());
+fprintf(fp_debug, "dev_send_buf:    %d\n", max_send);
+fprintf(fp_debug, "dev_target_offset_counts: %d\n", offset_counts.size());
+fprintf(fp_debug, "dev_recv_buf: %d\n", max_recv);
+fprintf(fp_debug, "dev_local_buffer: %d\n", dev_local_buffer_size);
+fprintf(fp_debug, "common_workspace: %d\n", workspace_size);
+fprintf(fp_debug, "dev_pes: %d\n", xnpes);
+fprintf(fp_debug, "dev_recv_displs: %d\n", grid_size+1);
+fclose(fp_debug);
+*/
+
+	cudaMemcpy(dev_target_buffer, dev_local_buffer, local_recv_size_vcstar_to_vrstar*sizeof(float), cudaMemcpyDeviceToDevice);
+
+	MPI_Barrier(mpi_comm);
+
+        //sync_counter++;
+ 	//Global_sync (my_pe_rank, dev_pes, xnpes, sync_counter, common_workspace, 0);
+	nvshmem_free(dev_recv_displs);
+	nvshmem_free(dev_send_displs);
+	nvshmem_free(dev_send_buf);
+	nvshmem_free(dev_target_offset_counts);
+	nvshmem_free(dev_recv_buf);
+	nvshmem_free(dev_local_buffer);
+	nvshmem_free(common_workspace);
+	nvshmem_free(dev_pes);
+}
+
+template<typename T>
+//void NVSHMEM_mcmr_to_mcstar_setup(MPI_Comm, int, int, int, int, int*, int*, int**, int** , T**, T**)
+void NVSHMEM_mcmr_to_mcstar_setup(MPI_Comm, int, int, int, int, int*, int*, int**, int** , T**, T**)
+{
+  throw std::runtime_error("Function not implemented\n");
+}
+void NVSHMEM_mcmr_to_mcstar_setup(
+	MPI_Comm mpi_comm,
+	int m, 
+	int n, 
+	int grid_height, 
+	int grid_width, 
+        int* my_pe_rank,
+        int* xnpes,
+        int** common_workspace,
+        int** dev_pes,
+        float** dev_recv_buf,
+        float** dev_send_buf)
+{
+    int grid_size = grid_height*grid_width;
+    std::vector<int> pes;
+    setup_pes(mpi_comm, my_pe_rank, pes, xnpes);
+
+    // Compute the maximum size for send and recv operation from MCMR form. 
+    // Need this because
+    // these buffers are SDOs of nvshmem (OpenSHMEM constraint)
+    int max_send = (int) (ceil(((double)m)/grid_height)*ceil(((double)n)/grid_width));
+
+    int workspace_size = grid_size;
+
+    MPI_Barrier(mpi_comm);
+    *common_workspace = (int*) nvshmem_malloc(workspace_size *sizeof(int));
+    if(common_workspace == NULL){
+       throw std::runtime_error("error allocating SDO");
+    }
+    *dev_pes = (int*) nvshmem_malloc(*xnpes*sizeof(int));
+    if(dev_pes == NULL){
+       throw std::runtime_error("error allocating SDO");
+    }
+    CHECK_CUDA(cudaMemset(*common_workspace, 0, workspace_size*sizeof(int)));
+    CHECK_CUDA(cudaMemcpy((void*) *dev_pes, (void const*) pes.data(), *xnpes*sizeof(int), cudaMemcpyHostToDevice));
+    *dev_recv_buf = (float*) nvshmem_malloc(grid_width*max_send*sizeof(float));
+    if(dev_recv_buf == NULL){
+       throw std::runtime_error("error allocating SDO");
+    }
+    *dev_send_buf = (float*) nvshmem_malloc(max_send*sizeof(float));
+    if(dev_send_buf == NULL){
+       throw std::runtime_error("error allocating SDO");
+    }
+    MPI_Barrier(mpi_comm);
+}
+
+template<typename T>
+void NVSHMEM_mcmr_to_mcstar_cleanup(MPI_Comm, int*, int* , T*, T*)
+{
+  throw std::runtime_error("Function not implemented\n");
+}
+void NVSHMEM_mcmr_to_mcstar_cleanup(MPI_Comm mpi_comm,
+        int* common_workspace,
+        int* dev_pes,
+        float* dev_recv_buf,
+        float* dev_send_buf)
+{
+    MPI_Barrier(mpi_comm);
+    nvshmem_free(common_workspace);
+    nvshmem_free(dev_pes);
+    nvshmem_free(dev_recv_buf);
+    nvshmem_free(dev_send_buf);
+    MPI_Barrier(mpi_comm);
+}
+
+template<typename T>
+//void NVSHMEM_mcmr_to_mrstar_setup(MPI_Comm, int, int, int, int, int*, int*, int**, int** , T**, T**)
+void NVSHMEM_mcmr_to_mrstar_setup(MPI_Comm, int, int, int, int, int*, int*, int**, int**, int**, T**, T**)
+{
+  throw std::runtime_error("Function not implemented\n");
+}
+void NVSHMEM_mcmr_to_mrstar_setup(
+	MPI_Comm mpi_comm,
+	int m, 
+	int n, 
+	int grid_height, 
+	int grid_width, 
+        int* my_pe_rank,
+        int* xnpes,
+        int** common_workspace,
+        int** dev_pes,
+        int** dev_sync_counter,
+        float** dev_recv_buf,
+        float** dev_send_buf)
+{
+    int grid_size = grid_height*grid_width;
+    std::vector<int> pes;
+    setup_pes(mpi_comm, my_pe_rank, pes, xnpes);
+
+    // Compute the maximum size for send and recv operation from MCMR form. 
+    // Need this because
+    // these buffers are SDOs of nvshmem (OpenSHMEM constraint)
+    int max_send = (int) (ceil(((double)m)/grid_height)*ceil(((double)n)/grid_width));
+
+    int workspace_size = grid_size;
+
+    MPI_Barrier(mpi_comm);
+    *common_workspace = (int*) nvshmem_malloc(workspace_size *sizeof(int));
+    if(*common_workspace == NULL){
+       throw std::runtime_error("error allocating SDO");
+    }
+    *dev_pes = (int*) nvshmem_malloc(*xnpes*sizeof(int));
+    if(*dev_pes == NULL){
+       throw std::runtime_error("error allocating SDO");
+    }
+    *dev_sync_counter = (int*) nvshmem_malloc(sizeof(int));
+    if(*dev_sync_counter == NULL){
+       throw std::runtime_error("error allocating SDO");
+    }
+    CHECK_CUDA(cudaMemset(*common_workspace, 0, workspace_size*sizeof(int)));
+    CHECK_CUDA(cudaMemset(*dev_sync_counter, 0, sizeof(int)));
+    CHECK_CUDA(cudaMemcpy((void*) *dev_pes, (void const*) pes.data(), *xnpes*sizeof(int), cudaMemcpyHostToDevice));
+    *dev_recv_buf = (float*) nvshmem_malloc(grid_height*max_send*sizeof(float));
+    if(*dev_recv_buf == NULL){
+       throw std::runtime_error("error allocating SDO");
+    }
+    *dev_send_buf = (float*) nvshmem_malloc(max_send*sizeof(float));
+    if(*dev_send_buf == NULL){
+       throw std::runtime_error("error allocating SDO");
+    }
+    MPI_Barrier(mpi_comm);
+}
+
+template<typename T>
+void NVSHMEM_mcmr_to_mrstar_cleanup(MPI_Comm, int*, int*, int*, T*, T*)
+{
+  throw std::runtime_error("Function not implemented\n");
+}
+void NVSHMEM_mcmr_to_mrstar_cleanup(MPI_Comm mpi_comm,
+        int* common_workspace,
+        int* dev_pes,
+        int* dev_sync_counter,
+        float* dev_recv_buf,
+        float* dev_send_buf)
+{
+    MPI_Barrier(mpi_comm);
+    nvshmem_free(common_workspace);
+    nvshmem_free(dev_pes);
+    nvshmem_free(dev_sync_counter);
+    nvshmem_free(dev_recv_buf);
+    nvshmem_free(dev_send_buf);
+    MPI_Barrier(mpi_comm);
+}
+
+//void mcmr_to_mrstar(MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int, T*, T*, T*, T*, cudaStream_t stream)
+template<typename T>
+void mcmr_to_mrstar(FILE*, MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int*, int, T*, T*, T*, T*, cudaStream_t stream)
+{
+  throw std::runtime_error("Function not implemented\n");
+}
+
+#include <sys/time.h>
+
+//void mcmr_to_mrstar(MPI_Comm mpi_comm,
+void mcmr_to_mrstar(FILE *fp_debug,
+	MPI_Comm mpi_comm,
+	float *run_timer,
+	cudaEvent_t kernel_start,
+	cudaEvent_t kernel_stop,
+	int sync_counter,
+	int m, 
+	int n, 
+	int grid_height, 
+	int grid_width, 
+	int my_pe_rank,
+	int* common_workspace,
+	int* dev_pes,
+	int* dev_sync_counter,
+	int  xnpes,
+	float* dev_send_buf,
+	float* dev_recv_buf,
+	float* dev_local_buffer, 
+        float* dev_target_buffer,
+	cudaStream_t stream)
+{
+
+    int grid_size = grid_height*grid_width;
+
+    int my_displs;
+    int total_gather;
+    int num_threads;
+    counts_mcmr_to_mrstar(grid_height, grid_width, my_pe_rank, m, n, &total_gather, &my_displs);
+
+    int mcmr_local_height  = local_height_mcmr(my_pe_rank, m, n, grid_height, grid_width);
+    int mcmr_local_width   = local_width_mcmr(my_pe_rank, m, n, grid_height, grid_width);
+    int local_buffer_size = mcmr_local_height*mcmr_local_width;
+
+// IMPORTANT: Don't change following routines as they are known to output correct results
+// From here ==============================================
+    MPI_Barrier(mpi_comm);
+    num_threads = min(local_buffer_size, 1024);
+    pack_mcmr_to_mrstar<<<1,num_threads,0,stream>>> (m, n, my_pe_rank, grid_height, grid_width, dev_local_buffer, dev_send_buf);
+    MPI_Barrier(mpi_comm);
+
+    std::vector<int> pes(grid_size);
+    CHECK_CUDA(cudaMemcpy((void*) pes.data(), (void const*) dev_pes, grid_size*sizeof(int), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy((void*) (dev_recv_buf+my_displs), (void const*) dev_send_buf, 
+local_buffer_size*sizeof(float), cudaMemcpyDeviceToDevice));
+    CHECK_CUDA(cudaMemcpy((void*) dev_sync_counter, (void const*) &sync_counter, sizeof(int), cudaMemcpyHostToDevice));
+    MPI_Barrier(mpi_comm);
+
+    float cudaTime;
+    cudaEventRecord(kernel_start, stream  );
+// Upto here ==============================================
+
+#if 0
+// Put only experimental routines here.
+    num_threads = min(local_buffer_size, 1024);
+//    empty_kernel<<<1,num_threads,0,stream>>> ();
+    cudaEventRecord(kernel_start, stream  );
+    allgather_unpack_mcmr_to_mrstar<<<1,num_threads,0,stream>>> (
+        my_pe_rank, m, n, grid_height, grid_width,
+        dev_send_buf, dev_recv_buf,
+        dev_target_buffer, total_gather,
+        local_buffer_size, my_displs, dev_pes, xnpes, dev_sync_counter, common_workspace);
+    cudaEventRecord(kernel_stop, stream  );
+    cudaEventSynchronize(kernel_stop);                     \
+    cudaEventElapsedTime(&cudaTime, kernel_start, kernel_stop);   \
+printf("after allgather_unpack_mcmr_to_mrstar: %f\n", cudaTime);
+    *run_timer += cudaTime;
+
+#else
+// IMPORTANT: Following routines are known to produce correct reults
+// Don't change anything 
+#if 0
+    num_threads = min(total_gather, 1024);
+    if(num_threads < grid_height){
+  	throw std::runtime_error("Number of threads too small for given grid\n");
+    }
+
+    MPI_Barrier(mpi_comm);
+    cudaEventRecord(kernel_start, stream  );
+    gather_unpack_mcmr_to_mrstar<<<1,num_threads,0,stream>>> (
+	my_pe_rank, m, n, grid_height, grid_width, 
+    	dev_send_buf, dev_recv_buf, 
+	dev_target_buffer, total_gather,
+	local_buffer_size, my_displs, dev_pes, xnpes, dev_sync_counter, common_workspace);
+    cudaEventRecord(kernel_stop, stream  );
+    cudaEventSynchronize(kernel_stop);                     \
+    cudaEventElapsedTime(&cudaTime, kernel_start, kernel_stop);   \
+    *run_timer += cudaTime;
+    MPI_Barrier(mpi_comm);
+
+fprintf(fp_debug, "after gather_unpack_mcmr_to_mrstar: %f\n", cudaTime);
+#else
+#if 1
+    int my_col_rank = my_pe_rank/grid_height;
+    int my_row_rank = my_pe_rank%grid_height;
+
+    for (int i = 1; i <=grid_height; ++i)
+    {
+        auto const offset = (my_row_rank + i) % grid_height;
+        auto const target_pe = offset + my_col_rank*grid_height;
+        auto const peer = pes[target_pe];
+
+        nvshmemx_float_put_on_stream (dev_recv_buf+my_displs, dev_send_buf, local_buffer_size, peer, stream);
+    }
+    nvshmemx_quiet_on_stream(stream);
+#else
+    Allgatherv_put_col(my_pe_rank, m, n, grid_height, grid_width, dev_send_buf, dev_recv_buf, local_buffer_size, my_displs, dev_pes, xnpes, sync_counter, common_workspace, stream); 
+#endif
+    cudaEventRecord(kernel_stop, stream  );
+    cudaEventSynchronize(kernel_stop);                     \
+    cudaEventElapsedTime(&cudaTime, kernel_start, kernel_stop);   \
+    *run_timer += cudaTime;
+    MPI_Barrier(mpi_comm);
+fprintf(fp_debug, ">> after gather_nvshmemx_float_put_on_stream: %f\n", cudaTime);
+
+    num_threads = min(total_gather, 1024);
+    if(num_threads < grid_height){
+  	throw std::runtime_error("Number of threads too small for given grid\n");
+    }
+    MPI_Barrier(mpi_comm);
+    cudaEventRecord(kernel_start, stream  );
+    unpack_mcmr_to_mrstar<<<1,num_threads,0,stream>>> (m, n, my_pe_rank, grid_height, grid_width, dev_target_buffer, dev_recv_buf, total_gather);
+    cudaEventRecord(kernel_stop, stream  );
+    cudaEventSynchronize(kernel_stop);                     \
+    cudaEventElapsedTime(&cudaTime, kernel_start, kernel_stop);   \
+    *run_timer += cudaTime;
+    MPI_Barrier(mpi_comm);
+fprintf(fp_debug, ">> after unpack_mcmr_to_mrstar: %f\n", cudaTime);
+#endif
+#endif
+}
+
+template<typename T>
+void mcmr_to_mcstar(MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int, T*, T*, T*, T*, cudaStream_t stream)
+{
+  throw std::runtime_error("Function not implemented\n");
+}
+
+#include <sys/time.h>
+
+//void mcmr_to_mcstar(MPI_Comm mpi_comm,
+void mcmr_to_mcstar(
+	MPI_Comm mpi_comm,
+	float *run_timer,
+	cudaEvent_t kernel_start,
+	cudaEvent_t kernel_stop,
+	int sync_counter,
+	int m, 
+	int n, 
+	int grid_height, 
+	int grid_width, 
+	int my_pe_rank,
+	int* common_workspace,
+	int* dev_pes,
+	int  xnpes,
+	float* dev_send_buf,
+	float* dev_recv_buf,
+	float* dev_local_buffer, 
+        float* dev_target_buffer,
+	cudaStream_t stream)
+{
+
+    int grid_size = grid_height*grid_width;
+
+    int my_displs;
+    int total_gather;
+    counts_mcmr_to_mcstar(grid_height, grid_width, my_pe_rank, m, n, &total_gather, &my_displs);
+
+    int mcmr_local_height  = local_height_mcmr(my_pe_rank, m, n, grid_height, grid_width);
+    int mcmr_local_width   = local_width_mcmr(my_pe_rank, m, n, grid_height, grid_width);
+    int local_buffer_size = mcmr_local_height*mcmr_local_width;
+
+    // Compute the maximum size for send and recv operation from MCMR form. 
+    // Need this because
+    // these buffers are SDOs of nvshmem (OpenSHMEM constraint)
+
+
+    MPI_Barrier(mpi_comm);
+    CHECK_CUDA(cudaMemcpy((void*) dev_send_buf, (void const*) dev_local_buffer, local_buffer_size*sizeof(float), cudaMemcpyDeviceToDevice));
+    MPI_Barrier(mpi_comm);
+
+    std::vector<int> pes(grid_size);
+    CHECK_CUDA(cudaMemcpy((void*) pes.data(), (void const*) dev_pes, grid_size*sizeof(int), cudaMemcpyDeviceToHost));
+
+    float cudaTime;
+    cudaEventRecord(kernel_start, stream  );
+#if 1
+    int my_col_rank = my_pe_rank/grid_height;
+    int my_row_rank = my_pe_rank%grid_height;
+
+    for (int i = 1; i <=grid_width; ++i)
+    {
+        auto const offset = (my_col_rank + i) % grid_width;
+        auto const target_pe = offset*grid_height + my_row_rank;
+        auto const peer = pes[target_pe];
+
+        nvshmemx_float_put_on_stream (dev_recv_buf+my_displs, dev_send_buf, local_buffer_size, peer, stream);
+    }
+    nvshmemx_quiet_on_stream(stream);
+
+#else
+    Allgatherv_put_row(my_pe_rank, grid_height, grid_width, dev_send_buf, dev_recv_buf, local_buffer_size, my_displs, dev_pes, xnpes, sync_counter, common_workspace, stream); 
+#endif
+    cudaEventRecord(kernel_stop, stream  );
+    cudaEventSynchronize(kernel_stop);                     \
+    cudaEventElapsedTime(&cudaTime, kernel_start, kernel_stop);   \
+    *run_timer += cudaTime;
+
+    int num_threads = min(total_gather, 1024);
+    cudaEventRecord(kernel_start, stream  );
+    unpack_mcmr_to_mcstar<<<1,num_threads,0,stream>>> (m, n, my_pe_rank, grid_height, grid_width, dev_target_buffer, dev_recv_buf, total_gather);
+    cudaEventRecord(kernel_stop, stream  );
+    cudaEventSynchronize(kernel_stop);                     \
+    cudaEventElapsedTime(&cudaTime, kernel_start, kernel_stop);   \
+    *run_timer += cudaTime;
+}
+
+
+template<typename T>
+void mcmr_to_vrstar(MPI_Comm, int, int, int, int, T*, T*, cudaStream_t)
+{
+  throw std::runtime_error("Function not implemented\n");
+}
+
+void mcmr_to_vrstar(MPI_Comm mpi_comm,
+	int m,
+	int n,
+	int grid_height,
+	int grid_width,
+	float* dev_B_buffer,
+	float* dev_target_buffer,
+	cudaStream_t stream)
+{
+  int grid_size = grid_height*grid_width;
+  int my_pe_rank;
+  std::vector<int> pes;
+  int xnpes;
+  setup_pes(mpi_comm, &my_pe_rank, pes, &xnpes);
+
+  int mcmr_local_height  = local_height_mcmr(my_pe_rank, m, n, grid_height, grid_width);
+  int mcmr_local_width   = local_width_mcmr(my_pe_rank, m, n, grid_height, grid_width);
+
+  std::vector<int> send_counts(grid_size, 0);
+  std::vector<int> send_displs(grid_size+1, 0);
+  int total_send;
+  int max_send;
+  std::vector<int> recv_counts(grid_size, 0);
+  std::vector<int> recv_displs(grid_size+1, 0);
+  int total_recv;
+  int max_recv;
+
+  // Compute the maximum size for send and recv operation. Need this because
+  // these buffers are SDOs of nvshmem (OpenSHMEM constraint)
+  max_send = (int) (ceil(((double)m)/grid_height)*ceil(((double)n)/grid_width));
+  max_recv = (int) (ceil(((double)m)/grid_size)*n);
+
+  std::vector<int> offset_counts (grid_size*2, 0);
+
+  counts_mcmr_to_vc_star(grid_height, grid_width, my_pe_rank, m, n,
+                send_counts, send_displs, &total_send,
+                recv_counts, recv_displs, &total_recv,
+                offset_counts);
+  int num_threads = min(total_send, 1024);
+
+  int* dev_send_displs = (int*) nvshmem_malloc(send_displs.size()*sizeof(int));
+  if(dev_send_displs == NULL){
+     throw std::runtime_error("error allocating SDO");
+  }
+  float* dev_send_buf = (float*) nvshmem_malloc(max_send*sizeof(float));
+  if(dev_send_buf == NULL){
+     throw std::runtime_error("error allocating SDO");
+  }
+  int* dev_target_offset_counts = (int*) nvshmem_malloc(offset_counts.size()*sizeof(int));
+  if(dev_target_offset_counts == NULL){
+     throw std::runtime_error("error allocating SDO");
+  }
+  float* dev_recv_buf = (float*) nvshmem_malloc(max_recv*sizeof(float));
+  if(dev_recv_buf == NULL){
+     throw std::runtime_error("error allocating SDO");
+  }
+  CHECK_CUDA(cudaMemcpy((void*) dev_target_offset_counts, (void const*) offset_counts.data(), offset_counts.size()*sizeof(int), cudaMemcpyHostToDevice));
+  CHECK_CUDA(cudaMemcpy((void*) dev_send_displs, (void const*) send_displs.data(), send_displs.size()*sizeof(int), cudaMemcpyHostToDevice));
+
+  int to_pe = vcstar_to_vrstar_to_pid(my_pe_rank, grid_height, grid_width);
+  int from_pe = vcstar_to_vrstar_from_pid(my_pe_rank, grid_height, grid_width);
+  int local_recv_size_vcstar_to_vrstar = local_height_vcstar(from_pe, m, n, grid_height, grid_width) * local_width_vcstar(from_pe, m, n, grid_height, grid_width);
+
+  int dev_local_buffer_size = max(max_recv, mcmr_local_height*mcmr_local_width);
+  dev_local_buffer_size = max(dev_local_buffer_size, max_send);
+  dev_local_buffer_size = max(dev_local_buffer_size, local_height_vrstar(my_pe_rank, m, n, grid_height, grid_width)*local_width_vrstar(my_pe_rank, m, n, grid_height, grid_width));
+  dev_local_buffer_size = max(dev_local_buffer_size, local_recv_size_vcstar_to_vrstar);
+  float* dev_local_buffer = (float*) nvshmem_malloc(dev_local_buffer_size*sizeof(float));
+  if(dev_local_buffer == NULL){
+     throw std::runtime_error("error allocating SDO");
+  }
+
+  CHECK_CUDA(cudaMemcpy((void*) dev_local_buffer, (void const*) dev_B_buffer, 
+  mcmr_local_height*mcmr_local_width*sizeof(float), cudaMemcpyDeviceToDevice));
+
+  pack_mcmr_to_vc_star<<<1,num_threads,0, stream>>> (m, n, my_pe_rank, grid_height, grid_width, dev_send_displs, dev_local_buffer, dev_send_buf);
+
+  int workspace_size = grid_size;
+  MPI_Barrier(mpi_comm);
+  int* common_workspace = (int*) nvshmem_malloc(workspace_size *sizeof(int));
+  if(common_workspace == NULL){
+     throw std::runtime_error("error allocating SDO");
+  }
+  int* dev_pes = (int*) nvshmem_malloc(xnpes*sizeof(int));
+  if(dev_pes == NULL){
+     throw std::runtime_error("error allocating SDO");
+  }
+  CHECK_CUDA(cudaMemset(common_workspace, 0, workspace_size*sizeof(int)));
+  CHECK_CUDA(cudaMemcpy((void*) dev_pes, (void const*) pes.data(), xnpes*sizeof(int), cudaMemcpyHostToDevice));
+  MPI_Barrier(mpi_comm);
+
+  int sync_counter=1;
+  Alltoallv_put(total_recv, my_pe_rank, dev_send_buf, dev_recv_buf, dev_send_displs, dev_target_offset_counts, dev_pes, xnpes, sync_counter, common_workspace, stream);
+
+  int* dev_recv_displs = (int*) nvshmem_malloc(grid_size+1);
+  if(dev_recv_displs == NULL){
+     throw std::runtime_error("error allocating SDO");
+  }
+
+  CHECK_CUDA(cudaMemcpy((void*) dev_recv_displs, (void const*) recv_displs.data(), (grid_size+1)*sizeof(int), cudaMemcpyHostToDevice));
+
+  num_threads = min(max_recv, 1024);
+  unpack_mcmr_to_vc_star<<<1,num_threads,0,stream>>> (m, n, my_pe_rank, grid_height, grid_width, dev_recv_displs, dev_local_buffer, dev_recv_buf);
+
+/*
 //printf("(%d) after unpack_mcmr_to_vc_star \n", my_pe_rank);
 char line[132];
 FILE* fp_debug;
@@ -1587,40 +3017,43 @@ sprintf(line, "to_from_pe.%04d", my_pe_rank);
 fp_debug = fopen(line, "w");
 fprintf(fp_debug, "to_pe=%d, from_pe=%d\n", to_pe, from_pe);
 fclose(fp_debug);
+*/
 
-    	// Calculate the PEs to send to and receive from me
-    	int local_size =  local_height_vcstar(my_pe_rank, m, n, grid_height, grid_width) * local_width_vcstar(my_pe_rank, m, n, grid_height, grid_width);
+  // Calculate the PEs to send to and receive from me
+  int local_size =  local_height_vcstar(my_pe_rank, m, n, grid_height, grid_width) * local_width_vcstar(my_pe_rank, m, n, grid_height, grid_width);
 
-    	int my_send_size_vcstar_to_vrstar = local_size;
-    	int max_recv_size_vcstar_to_vrstar = (int) ceil(((double)m)/grid_height) * local_width_vcstar(from_pe, m, n, grid_height, grid_width);
-    	float* dev_vrstar_recv_buffer = (float*) nvshmem_malloc(max_recv_size_vcstar_to_vrstar*sizeof(float));
+  int my_send_size_vcstar_to_vrstar = local_size;
+  int max_recv_size_vcstar_to_vrstar = (int) ceil(((double)m)/grid_height) * local_width_vcstar(from_pe, m, n, grid_height, grid_width);
+  float* dev_vrstar_recv_buffer = (float*) nvshmem_malloc(max_recv_size_vcstar_to_vrstar*sizeof(float));
+  if(dev_vrstar_recv_buffer == NULL){
+     throw std::runtime_error("error allocating SDO");
+  }
 
-    	sync_counter++;
-    	Sendrecv_put(dev_local_buffer, local_size, to_pe,
-                 dev_vrstar_recv_buffer, from_pe,
-                 my_pe_rank, dev_pes, xnpes, sync_counter, common_workspace, stream);
+  sync_counter++;
+  Sendrecv_put(dev_local_buffer, local_size, to_pe,
+              dev_vrstar_recv_buffer, from_pe,
+              my_pe_rank, dev_pes, xnpes, sync_counter, common_workspace, stream);
 
 //printf("(%d) after Sendrecv_put \n", my_pe_rank);
-    	// At this point, dev_recv_buffer has exchanged data, which is needed to copied back to the local_buffer
-    	// No copying needed if to_pe == from_pe
-    	if(!(my_pe_rank == to_pe && my_pe_rank == from_pe))
-    	//if(to_pe != from_pe)
-    	{// send/recv only when it is needed
-           if(local_size != local_recv_size_vcstar_to_vrstar)
-           {// nvshmem_realloc is need to adjust local buffer for new data
-            //nvshmem_realloc(local_buffer, new_recv_size_vcstar_to_vrstar*sizeof(T));
+  // At this point, dev_recv_buffer has exchanged data, which is needed to copied back to the local_buffer
+  // No copying needed if to_pe == from_pe
+  if(!(my_pe_rank == to_pe && my_pe_rank == from_pe))
+  //if(to_pe != from_pe)
+  {// send/recv only when it is needed
+        if(local_size != local_recv_size_vcstar_to_vrstar)
+        {// nvshmem_realloc is need to adjust local buffer for new data
+         //nvshmem_realloc(local_buffer, new_recv_size_vcstar_to_vrstar*sizeof(T));
 
-	    //   nvshmem_free(dev_local_buffer);
-	    //   dev_local_buffer = (float*) nvshmem_malloc(local_recv_size_vcstar_to_vrstar*sizeof(float));
-           }
-           CHECK_CUDA(cudaMemcpy((void*) dev_local_buffer, (void const*) dev_vrstar_recv_buffer,
-                                   local_recv_size_vcstar_to_vrstar*sizeof(float), cudaMemcpyDeviceToDevice));
-       }
+	 //   dev_local_buffer = (float*) nvshmem_malloc(local_recv_size_vcstar_to_vrstar*sizeof(float));
+        }
+        CHECK_CUDA(cudaMemcpy((void*) dev_local_buffer, (void const*) dev_vrstar_recv_buffer,
+                        local_recv_size_vcstar_to_vrstar*sizeof(float), cudaMemcpyDeviceToDevice));
+  }
 
 
+/*
 sprintf(line, "vrstar.%04d", my_pe_rank);
 fp_debug = fopen(line, "w");
-
 std::vector<float> B1_VR_STAR_mem_buffer(local_recv_size_vcstar_to_vrstar);
 cudaMemcpy(B1_VR_STAR_mem_buffer.data(), dev_local_buffer, local_recv_size_vcstar_to_vrstar*sizeof(float), cudaMemcpyDeviceToHost);
 fprintf(fp_debug, "Buffer of B_VR_STAR...\n");
@@ -1629,6 +3062,7 @@ for(int l=0; l<local_recv_size_vcstar_to_vrstar; l++){
 }
 fprintf(fp_debug, "\n");
 fclose(fp_debug);
+*/
 
 /*
 sprintf(line, "memsizes.%04d", my_pe_rank);
@@ -1646,21 +3080,19 @@ fprintf(fp_debug, "dev_vrstar_recv_buffer: %d\n", max_recv_size_vcstar_to_vrstar
 fclose(fp_debug);
 */
 
-	cudaMemcpy(dev_target_buffer, dev_local_buffer, local_recv_size_vcstar_to_vrstar*sizeof(float), cudaMemcpyDeviceToDevice);
+  cudaMemcpy(dev_target_buffer, dev_local_buffer, local_recv_size_vcstar_to_vrstar*sizeof(float), cudaMemcpyDeviceToDevice);
 
-	MPI_Barrier(mpi_comm);
+  MPI_Barrier(mpi_comm);
 
-        //sync_counter++;
- 	//Global_sync (my_pe_rank, dev_pes, xnpes, sync_counter, common_workspace, 0);
-	nvshmem_free(dev_vrstar_recv_buffer);
-	nvshmem_free(dev_recv_displs);
-	nvshmem_free(dev_send_displs);
-	nvshmem_free(dev_send_buf);
-	nvshmem_free(dev_target_offset_counts);
-	nvshmem_free(dev_recv_buf);
-	nvshmem_free(dev_local_buffer);
-	nvshmem_free(common_workspace);
-	nvshmem_free(dev_pes);
+  nvshmem_free(dev_vrstar_recv_buffer);
+  nvshmem_free(dev_recv_displs);
+  nvshmem_free(dev_send_displs);
+  nvshmem_free(dev_send_buf);
+  nvshmem_free(dev_target_offset_counts);
+  nvshmem_free(dev_recv_buf);
+  nvshmem_free(dev_local_buffer);
+  nvshmem_free(common_workspace);
+  nvshmem_free(dev_pes);
 
 }
 
@@ -1670,4 +3102,70 @@ template void mcmr_to_vrstar<__half>(MPI_Comm, int, int, int, int, __half*, __ha
 template void mcmr_to_vrstar<El::Complex<float>>(MPI_Comm, int, int, int, int, El::Complex<float>*, El::Complex<float>*, cudaStream_t);
 template void mcmr_to_vrstar<El::Complex<double>>(MPI_Comm, int, int, int, int, El::Complex<double>*, El::Complex<double>*, cudaStream_t);
 
+/*
+template void mcmr_to_mcstar<int>(MPI_Comm, int, int, int, int, int*, int*, cudaStream_t);
+template void mcmr_to_mcstar<double>(MPI_Comm, int, int, int, int, double*, double*, cudaStream_t);
+template void mcmr_to_mcstar<__half>(MPI_Comm, int, int, int, int, __half*, __half*, cudaStream_t);
+template void mcmr_to_mcstar<El::Complex<float>>(MPI_Comm, int, int, int, int, El::Complex<float>*, El::Complex<float>*, cudaStream_t);
+template void mcmr_to_mcstar<El::Complex<double>>(MPI_Comm, int, int, int, int, El::Complex<double>*, El::Complex<double>*, cudaStream_t);
+*/
+template void mcmr_to_mcstar<int>(MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int, int*, int*, int*, int*, cudaStream_t stream);
+template void mcmr_to_mcstar<double>(MPI_Comm, float*, cudaEvent_t, cudaEvent_t,  int, int, int, int, int, int, int*, int*, int, double*, double*, double*, double*, cudaStream_t stream);
+template void mcmr_to_mcstar<__half>(MPI_Comm, float*, cudaEvent_t, cudaEvent_t,  int, int, int, int, int, int, int*, int*, int, __half*, __half*, __half*, __half*, cudaStream_t stream);
+template void mcmr_to_mcstar<El::Complex<float>>(MPI_Comm, float*, cudaEvent_t, cudaEvent_t,  int, int, int, int, int, int, int*, int*, int, El::Complex<float>*, El::Complex<float>*, El::Complex<float>*, El::Complex<float>*, cudaStream_t stream);
+template void mcmr_to_mcstar<El::Complex<double>>(MPI_Comm, float*, cudaEvent_t, cudaEvent_t,  int, int, int, int, int, int, int*, int*, int, El::Complex<double>*, El::Complex<double>*, El::Complex<double>*, El::Complex<double>*, cudaStream_t stream);
+
+template void mcmr_to_vcstar<int>(MPI_Comm, int, int, int, int, int*, int*, cudaStream_t);
+template void mcmr_to_vcstar<double>(MPI_Comm, int, int, int, int, double*, double*, cudaStream_t);
+template void mcmr_to_vcstar<__half>(MPI_Comm, int, int, int, int, __half*, __half*, cudaStream_t);
+template void mcmr_to_vcstar<El::Complex<float>>(MPI_Comm, int, int, int, int, El::Complex<float>*, El::Complex<float>*, cudaStream_t);
+template void mcmr_to_vcstar<El::Complex<double>>(MPI_Comm, int, int, int, int, El::Complex<double>*, El::Complex<double>*, cudaStream_t);
+
+/*
+template void NVSHMEM_mcmr_to_mcstar_setup<int>(MPI_Comm, int, int, int, int, int*, int*, int**, int** , int**, int**);
+template void NVSHMEM_mcmr_to_mcstar_setup<double>(MPI_Comm, int, int, int, int, int*, int*, int**, int** , double**, double**);
+template void NVSHMEM_mcmr_to_mcstar_setup<__half>(MPI_Comm, int, int, int, int, int*, int*, int**, int** , __half**, __half**);
+template void NVSHMEM_mcmr_to_mcstar_setup<El::Complex<float>>(MPI_Comm, int, int, int, int, int*, int*, int**, int** , El::Complex<float>**, El::Complex<float>**);
+template void NVSHMEM_mcmr_to_mcstar_setup<El::Complex<double>>(MPI_Comm, int, int, int, int, int*, int*, int**, int** , El::Complex<double>**, El::Complex<double>**);
+*/
+template void NVSHMEM_mcmr_to_mcstar_setup<int>(MPI_Comm, int, int, int, int, int*, int*, int**, int** , int**, int**);
+template void NVSHMEM_mcmr_to_mcstar_setup<double>(MPI_Comm, int, int, int, int, int*, int*, int**, int** , double**, double**);
+template void NVSHMEM_mcmr_to_mcstar_setup<__half>(MPI_Comm, int, int, int, int, int*, int*, int**, int** , __half**, __half**);
+template void NVSHMEM_mcmr_to_mcstar_setup<El::Complex<float>>(MPI_Comm, int, int, int, int, int*, int*, int**, int** , El::Complex<float>**, El::Complex<float>**);
+template void NVSHMEM_mcmr_to_mcstar_setup<El::Complex<double>>(MPI_Comm, int, int, int, int, int*, int*, int**, int** , El::Complex<double>**, El::Complex<double>**);
+
+template void NVSHMEM_mcmr_to_mcstar_cleanup<int>(MPI_Comm, int*, int* , int*, int*);
+template void NVSHMEM_mcmr_to_mcstar_cleanup<double>(MPI_Comm, int*, int* , double*, double*);
+template void NVSHMEM_mcmr_to_mcstar_cleanup<__half>(MPI_Comm, int*, int* , __half*, __half*);
+template void NVSHMEM_mcmr_to_mcstar_cleanup<El::Complex<float>>(MPI_Comm, int*, int* , El::Complex<float>*, El::Complex<float>*);
+template void NVSHMEM_mcmr_to_mcstar_cleanup<El::Complex<double>>(MPI_Comm, int*, int* , El::Complex<double>*, El::Complex<double>*);
+
+template void mcmr_to_mrstar<int>(FILE *fp_debug, MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int*, int, int*, int*, int*, int*, cudaStream_t stream);
+template void mcmr_to_mrstar<double>(FILE *fp_debug, MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int*, int, double*, double*, double*, double*, cudaStream_t stream);
+template void mcmr_to_mrstar<__half>(FILE *fp_debug, MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int*, int, __half*, __half*, __half*, __half*, cudaStream_t stream);
+template void mcmr_to_mrstar<El::Complex<float>>(FILE *fp_debug, MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int*, int, El::Complex<float>*, El::Complex<float>*, El::Complex<float>*, El::Complex<float>*, cudaStream_t stream);
+template void mcmr_to_mrstar<El::Complex<double>>(FILE *fp_debug, MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int*, int, El::Complex<double>*, El::Complex<double>*, El::Complex<double>*, El::Complex<double>*, cudaStream_t stream);
+/*
+template void mcmr_to_mrstar<int>(MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int, int*, int*, int*, int*, cudaStream_t stream);
+template void mcmr_to_mrstar<double>(MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int, double*, double*, double*, double*, cudaStream_t stream);
+template void mcmr_to_mrstar<__half>(MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int, __half*, __half*, __half*, __half*, cudaStream_t stream);
+template void mcmr_to_mrstar<El::Complex<float>>(MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int, El::Complex<float>*, El::Complex<float>*, El::Complex<float>*, El::Complex<float>*, cudaStream_t stream);
+template void mcmr_to_mrstar<El::Complex<double>>(MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int, El::Complex<double>*, El::Complex<double>*, El::Complex<double>*, El::Complex<double>*, cudaStream_t stream);
+*/
+
+
+template void NVSHMEM_mcmr_to_mrstar_setup<int>(MPI_Comm, int, int, int, int, int*, int*, int**, int**, int**, int**, int**);
+template void NVSHMEM_mcmr_to_mrstar_setup<double>(MPI_Comm, int, int, int, int, int*, int*, int**, int**, int**, double**, double**);
+template void NVSHMEM_mcmr_to_mrstar_setup<__half>(MPI_Comm, int, int, int, int, int*, int*, int**, int**, int**, __half**, __half**);
+template void NVSHMEM_mcmr_to_mrstar_setup<El::Complex<float>>(MPI_Comm, int, int, int, int, int*, int*, int**, int**, int**, El::Complex<float>**, El::Complex<float>**);
+template void NVSHMEM_mcmr_to_mrstar_setup<El::Complex<double>>(MPI_Comm, int, int, int, int, int*, int*, int**, int**, int**,  El::Complex<double>**, El::Complex<double>**);
+
+template void NVSHMEM_mcmr_to_mrstar_cleanup<int>(MPI_Comm, int*, int*, int*,  int*, int*);
+template void NVSHMEM_mcmr_to_mrstar_cleanup<double>(MPI_Comm, int*, int*, int*,  double*, double*);
+template void NVSHMEM_mcmr_to_mrstar_cleanup<__half>(MPI_Comm, int*, int*, int*,  __half*, __half*);
+template void NVSHMEM_mcmr_to_mrstar_cleanup<El::Complex<float>>(MPI_Comm, int*, int*, int*,  El::Complex<float>*, El::Complex<float>*);
+template void NVSHMEM_mcmr_to_mrstar_cleanup<El::Complex<double>>(MPI_Comm, int*, int*, int*,  El::Complex<double>*, El::Complex<double>*);
+
 }// namespace hydrogen
+
+

@@ -63,9 +63,19 @@ void Gemm
 
 template<typename T>
 void Gemm
+( float *run_timer, 
+  cudaEvent_t kernel_start,
+  cudaEvent_t kernel_stop,
+  Orientation orientA, Orientation orientB,
+  T alpha, const AbstractDistMatrix<T>& A, const AbstractDistMatrix<T>& B,
+  T beta,        AbstractDistMatrix<T>& C, GemmAlgorithm alg=GEMM_DEFAULT );
+
+template<typename T>
+void Gemm
 ( Orientation orientA, Orientation orientB,
   T alpha, const AbstractDistMatrix<T>& A, const AbstractDistMatrix<T>& B,
   T beta,        AbstractDistMatrix<T>& C, GemmAlgorithm alg=GEMM_DEFAULT );
+
 
 template<typename T>
 void Gemm

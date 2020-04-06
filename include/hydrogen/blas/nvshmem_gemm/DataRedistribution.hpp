@@ -169,6 +169,27 @@ template <typename T>
 __global__
 void unpack_mcmr_to_vc_star(int m, int n, int me, int grid_height, int grid_width, int* recv_displs, T* local_buffer, T* recv_buffer);
 
+template <typename T>
+__global__
+void unpack_mcmr_to_mcstar(int m, int n, int me, int grid_height, int grid_width, T* dev_target_buffer, T* recv_buffer, int recv_buffer_size);
+
+template <typename T>
+__global__
+void unpack_mcmr_to_mrstar(int m, int n, int me, int grid_height, int grid_width, T* dev_target_buffer, T* recv_buffer, int recv_buffer_size);
+
+template <typename T>
+__global__
+void gather_unpack_mcmr_to_mrstar (
+    int my_pe_rank, int m, int n, int grid_height, int grid_width,
+    T* dev_send_buf, T* dev_recv_buf, 
+    T* dev_target_buffer, int total_gather,
+    int send_size, int my_displs, int* const pes, int const npes, int const sync_counter, int* const workspace);
+
+__global__
+void empty_kernel();
+
+float kernel_launch_overhead(cudaStream_t stream, cudaEvent_t kernel_start, cudaEvent_t kernel_stop);
+
 // Here 'my_pe_rank' is my pe rank, not MPI rank, and needs to be mapped to actual
 // PE via pes before communication.
 template <typename T>
@@ -178,6 +199,14 @@ void Allgatherv_put_kernel(
     T* __restrict__ sbuf, T* __restrict__ rbuf,
     int const displacement, int const size,
     int const* pes, int const npes, int* const workspace);
+
+template <typename T>
+__global__
+void Allgatherv_put_row_kernel(
+    int const my_pe_rank, int const grid_height, int const grid_width,
+    T* __restrict__ sbuf, T* __restrict__ rbuf,
+    int const my_displ, int send_size,
+    int const* pes, int const npes, int const sync_counter, int* const workspace);
 
 template<typename T>
 __global__
@@ -239,7 +268,7 @@ void Alltoall_put_kernel_boring(
 __global__
 void Global_sync_kernel(
     int const* pes, int const npes, int const my_pe_rank,
-    int const  sync_counter, int* workspace);
+    int const*  sync_counter, int* workspace);
 //}// namespace <anon>
 
 #if 1
@@ -265,6 +294,48 @@ void mcmr_to_vrstar(MPI_Comm mpi_comm,
 	T* dev_target_buffer,
 	cudaStream_t stream);
 void mcmr_to_vrstar(MPI_Comm, int, int, int, int, float*, float*, cudaStream_t);
+
+template<typename T>
+void mcmr_to_mcstar(MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int, T*, T*, T*, T*, cudaStream_t stream);
+void mcmr_to_mcstar(MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int, float*, float*, float*, float*, cudaStream_t stream);
+
+/*
+template<typename T>
+void mcmr_to_mrstar(MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int, T*, T*, T*, T*, cudaStream_t stream);
+void mcmr_to_mrstar(MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int, float*, float*, float*, float*, cudaStream_t stream);
+*/
+template<typename T>
+void mcmr_to_mrstar(FILE*, MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int*, int, T*, T*, T*, T*, cudaStream_t stream);
+void mcmr_to_mrstar(FILE*, MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int*, int, float*, float*, float*, float*, cudaStream_t stream);
+
+
+
+template<typename T>
+void NVSHMEM_mcmr_to_mcstar_setup(MPI_Comm, int, int, int, int, int*, int*, int**, int** , T**, T**);
+void NVSHMEM_mcmr_to_mcstar_setup(MPI_Comm, int, int, int, int, int*, int*, int**, int**, float**, float**);
+
+template<typename T>
+void NVSHMEM_mcmr_to_mcstar_cleanup(MPI_Comm, int*, int* , T*, T*);
+void NVSHMEM_mcmr_to_mcstar_cleanup(MPI_Comm, int*, int*, float*, float*);
+
+template<typename T>
+void NVSHMEM_mcmr_to_mrstar_setup(MPI_Comm, int, int, int, int, int*, int*, int**, int**, int**, T**, T**);
+void NVSHMEM_mcmr_to_mrstar_setup(MPI_Comm, int, int, int, int, int*, int*, int**, int**, int**, float**, float**);
+
+template<typename T>
+void NVSHMEM_mcmr_to_mrstar_cleanup(MPI_Comm, int*, int*, int*, T*, T*);
+void NVSHMEM_mcmr_to_mrstar_cleanup(MPI_Comm, int*, int*, int*, float*, float*);
+
+template<typename T>
+void mcmr_to_vcstar(MPI_Comm mpi_comm,
+        int m,
+        int n,
+        int grid_height,
+        int grid_width,
+        float* dev_Matrix_buffer,
+        float* dev_target_buffer,
+        cudaStream_t stream);
+void mcmr_to_vcstar(MPI_Comm, int, int, int, int, float*, float*, cudaStream_t);
 
 // Convert a Matrix (of size m x n) in [MC,MR] format to the one in [VC,*] format
 // 'me' is my nvshmem pe, not MPI rank; it is expected that my PE number is computed prior 
@@ -338,11 +409,17 @@ void convert_vrstar_to_starvr(T* local_buffer, int const local_size, int const m
 
 // NOTE: 'my_pe_rank' is my PE number in (sub)communicator. Need to translate this to actual PE via pes
 
-void counts_mcmr_to_vc_star(
-	int my_pe_rank,
-	int k, int n, int grid_height, int grid_width,
-	std::vector<int>& mr_msg_cnts, std::vector<int>& star_mr_buffer_displs,
-	int *sum);
+void counts_mcmr_to_vc_star(int grid_height, int grid_width, int myrank, int m, int n,
+        std::vector<int>& send_counts, std::vector<int>& send_displs, int* total_send,
+        std::vector<int>& recv_counts, std::vector<int>& recv_displs, int* total_recv,
+        std::vector<int>& offset_counts);
+
+void counts_mcmr_to_mcstar(
+        int grid_height, int grid_width, int myrank, int m, int n, int* total_gather, int* my_displs);
+
+void counts_mcmr_to_mrstar(
+        int grid_height, int grid_width, int myrank, int m, int n, int* total_gather, int* my_displs);
+
 
 // mr_msg_cnt and star_mr_buffer_displs are vectors of grid_height and grid_height+1 elements, respectively.
 void counts_starvr_to_starmr(int const my_pe_rank, int const m, int const n, int const grid_height, int const grid_width, std::vector<int>& mr_msg_cnts, std::vector<int>& star_mr_buffer_displs, int* sum);
@@ -355,6 +432,14 @@ void Allgatherv_put(int const my_pe_rank, int const grid_height, int const grid_
 	T* dev_send_buf, T* dev_recv_buf,
 	int const offset, int const size,  
         int const* pes, int const npes,
+        int* const sync_space, cudaStream_t const stream);
+
+template <typename T>
+void Allgatherv_put_row(int const my_pe_rank, int const grid_height, int const grid_width,
+        T* dev_send_buf, T* dev_recv_buf, int send_size,
+        int const* my_displ,
+        int const* pes, int const npes,
+        int sync_counter,
         int* const sync_space, cudaStream_t const stream);
 
 // NOTE: Here, 'my_pe_rank' is my PE number in  given (sub)communicator.

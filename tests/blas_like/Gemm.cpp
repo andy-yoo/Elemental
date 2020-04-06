@@ -5,6 +5,8 @@
   which can be found in the LICENSE file in the root directory, or at
   http://opensource.org/licenses/BSD-2-Clause
 */
+#include <sys/time.h>
+
 #include <El.hpp>
 using namespace El;
 
@@ -16,10 +18,11 @@ using namespace El;
 #include <nvshmem.h>
 #include <nvshmemx.h>
 
-#define NUM_ITERS	0
-#define NUM_RUNS	1
 //#define NUM_ITERS	500
 //#define NUM_RUNS	1000
+
+struct timeval s, e;
+double elapsed;
 
 template<typename T, Device D>
 void TestAssociativity
@@ -97,8 +100,19 @@ void TestGemm
  bool print, bool correctness,
  Int colAlignA=0, Int rowAlignA=0,
  Int colAlignB=0, Int rowAlignB=0,
- Int colAlignC=0, Int rowAlignC=0)
+ Int colAlignC=0, Int rowAlignC=0,
+ char alg='A')
 {
+    int NUM_ITERS = 0;
+    int NUM_RUNS = 1;
+    char* env_string;
+    env_string = getenv ("EXP_NUM_ITERS");
+    if (env_string !=NULL)
+      NUM_ITERS = atoi(env_string);
+    env_string = getenv ("EXP_NUM_RUNS");
+    if (env_string !=NULL)
+      NUM_RUNS = atoi(env_string);
+
     OutputFromRoot(g.Comm(),"Testing with ",TypeName<T>());
     PushIndent();
 
@@ -124,51 +138,6 @@ void TestGemm
         Print(A, "A");
         Print(B, "B");
 
-#if 0
-/*
-    int my_row_rank = g.Row();
-    int my_col_rank = g.Col();
-    int myrank = g.Rank();
-    int grid_height = g.Height();
-    int grid_width = g.Width();
-    int grid_size = g.Size();
-
-    char line[132];
-    sprintf(line, "debug.%04d", myrank);
-    FILE *fp_debug = fopen(line, "w");
-    int local_height = B.LocalHeight();
-    int local_width = B.LocalWidth();
-
-    Matrix<T, D>& local_mat = B.Matrix();
-    for(int i=0; i<local_height; i++){
-          for(int j=0; j<local_width; j++)
-             fprintf(fp_debug, "%f ", (T) local_mat.Get(i,j));
-          fprintf(fp_debug, "\n");
-    }
-
-    auto kernel_B_buffer = local_mat.Buffer();
-    auto B_buffer = local_mat.Buffer();
-    T* mem_buffer = (T*) malloc(local_height*local_width*sizeof(T));
-    cudaMemcpy(mem_buffer, B_buffer, local_height*local_width*sizeof(T), cudaMemcpyDeviceToHost);
-
-    fprintf(fp_debug, "rank: %d\tLocal_Height=%d Local_Width=%d\n", myrank, local_mat.Height(), local_mat.Width());
-    fprintf(fp_debug, "Buffer of B...\n");
-    for(int j=0; j<local_height*local_width; j++){
-        fprintf(fp_debug, "%f ", (T) mem_buffer[j]);
-    }
-    fprintf(fp_debug, "\n");
-*/
-
-    printf( "rank: %d\tLocal_Height=%d Local_Width=%d\n", myrank, local_mat.Height(), local_mat.Width());
-    for(int i=0; i<local_height; i++){
-          for(int j=0; j<local_width; j++)
-             printf( "%f ", (T) local_mat.Get(i,j));
-          printf( "\n");
-    }
-    fclose(fp_debug);
-#endif
-
-
         Print(COrig, "COrig");
     }
 
@@ -178,16 +147,38 @@ void TestGemm
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     float cudaTime;
-#endif
+
+    cudaEvent_t kernel_start, kernel_stop;
+    cudaEventCreate(&kernel_start);
+    cudaEventCreate(&kernel_stop);
+    float run_timer = 0.0;
 
 /*
+    cudaEvent_t ovhead_start, ovhead_stop;
+    cudaEventCreate(&ovhead_start);
+    cudaEventCreate(&ovhead_stop);
+    cudaStream_t stream;
+    if (A.GetLocalDevice() == El::Device::GPU)
+       stream = static_cast<El::Matrix<T, El::Device::GPU> const&>(A.LockedMatrix()).Stream();
+    kernel_launch_overhead (stream, ovhead_start, ovhead_stop);
+*/
+
+#endif
+
+switch (alg){
+  case 'A':
     // Test the variant of Gemm that keeps A stationary
     C = COrig;
     OutputFromRoot(g.Comm(),"Stationary A algorithm:");
     PushIndent();
+
     mpi::Barrier(g.Comm());
     for(int repeat=0; repeat<NUM_ITERS; repeat++)
         Gemm(orientA, orientB, alpha, A, B, beta, C, GEMM_SUMMA_A);
+    for(int repeat=0; repeat<NUM_ITERS; repeat++)
+        Gemm(orientA, orientB, alpha, A, B, beta, C, GEMM_SUMMA_A);
+    mpi::Barrier(g.Comm());
+
     timer.Start();
     START_CUDA_TIMER;
     for(int repeat=0; repeat<NUM_RUNS; repeat++)
@@ -208,9 +199,46 @@ void TestGemm
     if (correctness)
         TestAssociativity(orientA, orientB, alpha, A, B, beta, COrig, C, print);
     PopIndent();
-*/
+    break;
 
- /*
+  case 'C':
+
+    // Test the variant of Gemm that keeps C stationary
+    C = COrig;
+    OutputFromRoot(g.Comm(),"Stationary C Algorithm:");
+    PushIndent();
+
+    run_timer = 0.0;
+    mpi::Barrier(g.Comm());
+    for(int repeat=0; repeat<NUM_RUNS; repeat++){
+        Gemm(orientA, orientB, alpha, A, B, beta, C, GEMM_SUMMA_C);
+        Gemm(orientA, orientB, alpha, A, B, beta, C, GEMM_SUMMA_C);
+        timer.Start();
+        START_CUDA_TIMER;
+        Gemm(&run_timer, kernel_start, kernel_stop,
+		orientA, orientB, alpha, A, B, beta, C, GEMM_SUMMA_C);
+        STOP_CUDA_TIMER;
+    }
+    mpi::Barrier(g.Comm());
+    runTime = timer.Stop();
+
+    printf("run_timer=%f\n", run_timer/1000.0);
+
+    realGFlops = 2.*double(m)*double(n)*double(k)/(1.e9*runTime);
+    gFlops = (IsComplex<T>::value ? 4*realGFlops : realGFlops);
+    if (D == Device::CPU)
+        OutputFromRoot
+            (g.Comm(),"Finished in ",runTime," seconds (",gFlops," GFlop/s)");
+    SUMMARIZE_CUDA_TIMER;
+    if (print)
+        Print(C, BuildString("C := ",alpha," A B + ",beta," C"));
+    if (correctness)
+        TestAssociativity
+            (orientA, orientB, alpha, A, B, beta, COrig, C, print);
+    PopIndent();
+    break;
+
+  case 'B':
     // Test the variant of Gemm that keeps B stationary
     C = COrig;
     OutputFromRoot(g.Comm(),"Stationary B Algorithm:");
@@ -236,39 +264,8 @@ void TestGemm
     if (correctness)
         TestAssociativity(orientA, orientB, alpha, A, B, beta, COrig, C, print);
     PopIndent();
-*/
-
-    // Test the variant of Gemm that keeps C stationary
-    C = COrig;
-    OutputFromRoot(g.Comm(),"Stationary C Algorithm:");
-    PushIndent();
-    mpi::Barrier(g.Comm());
-    for(int repeat=0; repeat<NUM_ITERS; repeat++)
-        Gemm(orientA, orientB, alpha, A, B, beta, C, GEMM_SUMMA_C);
-    mpi::Barrier(g.Comm());
-    timer.Start();
-    START_CUDA_TIMER;
-    for(int repeat=0; repeat<NUM_RUNS; repeat++)
-        Gemm(orientA, orientB, alpha, A, B, beta, C, GEMM_SUMMA_C);
-    STOP_CUDA_TIMER;
-
-    mpi::Barrier(g.Comm());
-    runTime = timer.Stop();
-    realGFlops = 2.*double(m)*double(n)*double(k)/(1.e9*runTime);
-    gFlops = (IsComplex<T>::value ? 4*realGFlops : realGFlops);
-    if (D == Device::CPU)
-        OutputFromRoot
-            (g.Comm(),"Finished in ",runTime," seconds (",gFlops," GFlop/s)");
-    SUMMARIZE_CUDA_TIMER;
-    if (print)
-        Print(C, BuildString("C := ",alpha," A B + ",beta," C"));
-    if (correctness)
-        TestAssociativity
-            (orientA, orientB, alpha, A, B, beta, COrig, C, print);
-    PopIndent();
-
-
-/*
+    break;
+  default:
     if (orientA == NORMAL && orientB == NORMAL)
     {
         // Test the variant of Gemm for panel-panel dot products
@@ -298,8 +295,7 @@ void TestGemm
                 (orientA, orientB, alpha, A, B, beta, COrig, C, print);
         PopIndent();
     }
-*/
-
+}
     PopIndent();
 #ifdef HYDROGEN_HAVE_CUDA
     cudaEventDestroy(start);
@@ -333,6 +329,8 @@ main(int argc, char* argv[])
         const Int rowAlignC = Input("--rowAlignC","row align of C",0);
         const bool testCPU = El::Input("--testCPU", "test CPU gemm?", true);
         const bool testGPU = El::Input("--testGPU", "test GPU gemm?", false);
+	const char alg = El::Input("--alg", "SUMMA Algorithm", 'A');
+
 
         ProcessInput();
         PrintInputReport();
@@ -367,9 +365,6 @@ main(int argc, char* argv[])
     cudaGetDeviceCount(&dev_count);
     cudaSetDevice(mype_node%dev_count);
 
-    cudaStream_t stream;
-    CHECK_CUDA( cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-
 
             TestGemm<float,Device::GPU>
                 (orientA, orientB,
@@ -380,7 +375,8 @@ main(int argc, char* argv[])
                  print, correctness,
                  colAlignA, rowAlignA,
                  colAlignB, rowAlignB,
-                 colAlignC, rowAlignC);
+                 colAlignC, rowAlignC,
+		 alg);
         }
 #else
         (void)testGPU;
