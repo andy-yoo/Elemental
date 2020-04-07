@@ -493,9 +493,10 @@ else{
 
     int B_my_pe_rank;
     int B_xnpes;
-    int* B_common_workspace;
+    long* B_common_workspace;
+    //int* B_common_workspace;
     int* B_dev_pes;
-    int* B_dev_sync_counter;
+    long* B_dev_sync_counter;
     T* B_dev_recv_buf;
     T* B_dev_send_buf;
     int B_width = (BsumDim < bsize)?BsumDim:bsize;
@@ -511,7 +512,7 @@ fp_debug = fopen(line, "w");
 sprintf(line, "nvshmem.%04d", mpi_myrank);
 FILE* fp_probe = fopen(line, "a");
 
-    int sync_counter = 0;
+    long sync_counter = 0;
     NVSHMEM_mcmr_to_mcstar_setup(
 	mpi_comm,
         A.Height(), 
@@ -546,6 +547,7 @@ FILE* fp_probe = fopen(line, "a");
         auto A1 = A(ALL,        IR(k,k+nb));
         auto B1 = B(IR(k,k+nb), ALL       );
 
+#if 0
 /*
         Copy (A1, A1_MCMR);
 	Matrix<T, D>& local_a1mcmr_mat = A1_MCMR.Matrix();
@@ -608,7 +610,6 @@ fprintf(fp_debug, "\n");
         Matrix<T, D>& local_mc_star_mat = A1_MC_STAR.Matrix();
         auto A1_MC_STAR_buffer = local_mc_star_mat.Buffer();
 
-#if 1
     cudaEventRecord(start, stream  );
 	mcmr_to_mcstar(mpi_comm,
 		run_timer,

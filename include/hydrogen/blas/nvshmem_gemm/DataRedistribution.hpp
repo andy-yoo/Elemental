@@ -304,9 +304,11 @@ template<typename T>
 void mcmr_to_mrstar(MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int, T*, T*, T*, T*, cudaStream_t stream);
 void mcmr_to_mrstar(MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int, float*, float*, float*, float*, cudaStream_t stream);
 */
+
+
 template<typename T>
-void mcmr_to_mrstar(FILE*, MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int*, int, T*, T*, T*, T*, cudaStream_t stream);
-void mcmr_to_mrstar(FILE*, MPI_Comm, float*, cudaEvent_t, cudaEvent_t, int, int, int, int, int, int, int*, int*, int*, int, float*, float*, float*, float*, cudaStream_t stream);
+void mcmr_to_mrstar(FILE*, MPI_Comm, float*, cudaEvent_t, cudaEvent_t, long, int, int, int, int, int, long*, int*, long*, int, T*, T*, T*, T*, cudaStream_t stream);
+void mcmr_to_mrstar(FILE*, MPI_Comm, float*, cudaEvent_t, cudaEvent_t, long, int, int, int, int, int, long*, int*, long*, int, float*, float*, float*, float*, cudaStream_t stream);
 
 
 
@@ -319,12 +321,12 @@ void NVSHMEM_mcmr_to_mcstar_cleanup(MPI_Comm, int*, int* , T*, T*);
 void NVSHMEM_mcmr_to_mcstar_cleanup(MPI_Comm, int*, int*, float*, float*);
 
 template<typename T>
-void NVSHMEM_mcmr_to_mrstar_setup(MPI_Comm, int, int, int, int, int*, int*, int**, int**, int**, T**, T**);
-void NVSHMEM_mcmr_to_mrstar_setup(MPI_Comm, int, int, int, int, int*, int*, int**, int**, int**, float**, float**);
+void NVSHMEM_mcmr_to_mrstar_setup(MPI_Comm, int, int, int, int, int*, int*, long**, int**, long**, T**, T**);
+void NVSHMEM_mcmr_to_mrstar_setup(MPI_Comm, int, int, int, int, int*, int*, long**, int**, long**, float**, float**);
 
 template<typename T>
-void NVSHMEM_mcmr_to_mrstar_cleanup(MPI_Comm, int*, int*, int*, T*, T*);
-void NVSHMEM_mcmr_to_mrstar_cleanup(MPI_Comm, int*, int*, int*, float*, float*);
+void NVSHMEM_mcmr_to_mrstar_cleanup(MPI_Comm, long*, int*, long*, T*, T*);
+void NVSHMEM_mcmr_to_mrstar_cleanup(MPI_Comm, long*, int*, long*, float*, float*);
 
 template<typename T>
 void mcmr_to_vcstar(MPI_Comm mpi_comm,
